@@ -604,7 +604,7 @@ fn replace_ignored_with_only_matching() {
     assert!(!stdout.contains("X"));
 }
 
-// ---------- v0.3.0 新增：-e / --files-without-match / --count-matches / --max-depth / --max-filesize / -q ----------
+// ---------- v0.3.0 新增 ----------
 
 #[test]
 fn multi_pattern_e_flag() {
@@ -637,7 +637,6 @@ fn multi_pattern_positional_plus_e() {
     let dir = TempDir::new("multipat2");
     dir.file("a.txt", "foo\nbar\nbaz\n");
 
-    // 位置参数 + -e 都算模式；用 -e 传所有模式，避免歧义
     let out = fsearch()
         .arg("-e")
         .arg("foo")
@@ -789,7 +788,7 @@ fn quiet_mode_returns_one_on_no_match() {
     assert!(out.stdout.is_empty());
 }
 
-// ---------- v0.3.0 新增：补全 / man ----------
+// ---------- v0.3.0 补全 / man ----------
 
 #[test]
 fn generate_completions_bash() {
@@ -801,7 +800,6 @@ fn generate_completions_bash() {
 
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // bash 补全脚本通常包含 _fsearch 函数
     assert!(stdout.contains("_fsearch") || stdout.contains("fsearch"));
 }
 
@@ -811,7 +809,6 @@ fn generate_man_page() {
 
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // man 页通常以 .TH 开头
     assert!(stdout.contains(".TH") || stdout.contains("FSEARCH"));
 }
 
@@ -823,7 +820,6 @@ fn build_index_then_use_index() {
     dir.file("a.txt", "hello world\n");
     dir.file("b.txt", "foo bar\n");
 
-    // 建立索引
     let out = fsearch()
         .arg("--build-index")
         .arg(dir.0.to_str().unwrap())
@@ -835,7 +831,6 @@ fn build_index_then_use_index() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // 使用索引搜索
     let out = fsearch()
         .arg("--use-index")
         .arg("hello")
@@ -853,22 +848,73 @@ fn build_index_then_use_index() {
 }
 
 #[test]
-fn use_index_without_index_errors() {
-    let dir = TempDir::new("idx_missing");
-    dir.file("a.txt", "hello\n");
+fn use_index_auto_builds_when_missing() {
+    let dir = TempDir::new("idx_auto");
+    dir.file("a.txt", "hello world\n");
+    dir.file("b.txt", "foo bar\n");
 
+    // v0.5.0：没有索引时 --use-index 自动建立并使用，而不是报错
     let out = fsearch()
         .arg("--use-index")
         .arg("hello")
         .arg(dir.0.to_str().unwrap())
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    let stderr = String::from_utf8_lossy(&out.stderr);
+
     assert!(
-        stderr.contains("索引") || stderr.contains("index"),
-        "stderr: {stderr}"
+        out.status.success(),
+        "exit: {:?}, stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
     );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("hello"), "stdout: {stdout}");
+
+    // 索引文件应该被创建
+    assert!(dir.0.join(".fsearch-index").exists());
+
+    // stderr 应该有提示
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("索引"), "stderr: {stderr}");
+}
+
+#[test]
+fn use_index_auto_rebuilds_when_stale() {
+    let dir = TempDir::new("idx_stale");
+    dir.file("a.txt", "hello\n");
+
+    // 先建好索引
+    let out = fsearch()
+        .arg("--build-index")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // 添加新文件，索引应该过期
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    dir.file("b.txt", "hello\n");
+
+    // --use-index 应该自动重建索引，两个文件都搜到
+    let out = fsearch()
+        .arg("--use-index")
+        .arg("hello")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "exit: {:?}, stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("a.txt"), "stdout: {stdout}");
+    assert!(stdout.contains("b.txt"), "stdout: {stdout}");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("索引"), "stderr: {stderr}");
 }
 
 #[test]

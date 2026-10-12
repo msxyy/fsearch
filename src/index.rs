@@ -36,7 +36,6 @@ impl Index {
                 continue;
             }
             let path = entry.path();
-            // 跳过索引文件自身
             if path.file_name().and_then(|s| s.to_str()) == Some(".fsearch-index") {
                 continue;
             }
@@ -56,7 +55,6 @@ impl Index {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            // 跳过二进制
             if content.contains(&0) {
                 continue;
             }
@@ -64,7 +62,6 @@ impl Index {
             let file_id = files.len() as u32;
             let path_str = path.display().to_string();
 
-            // 转小写后提取 trigram
             let lower: Vec<u8> = content.iter().map(|b| b.to_ascii_lowercase()).collect();
             if lower.len() >= 3 {
                 for i in 0..=lower.len() - 3 {
@@ -80,7 +77,6 @@ impl Index {
             });
         }
 
-        // 去重并排序
         for ids in trigrams.values_mut() {
             ids.sort_unstable();
             ids.dedup();
@@ -167,9 +163,58 @@ impl Index {
         Ok(Index { files, trigrams })
     }
 
+    /// 检查索引相对磁盘上的当前状态是否已过期
+    ///
+    /// 满足下列任一条件即视为过期：
+    /// - 有文件不存在了
+    /// - 有文件的 size 或 mtime 变了
+    /// - 目录下出现了索引里没有的新文件
+    pub fn is_stale(&self, root: &Path) -> bool {
+        // 先按索引里的清单检查
+        for f in &self.files {
+            let p = Path::new(&f.path);
+            let metadata = match fs::metadata(p) {
+                Ok(m) => m,
+                Err(_) => return true,
+            };
+            if metadata.len() != f.size {
+                return true;
+            }
+            let mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if mtime != f.mtime {
+                return true;
+            }
+        }
+
+        // 再查有没有索引里没记录的新文件
+        let walker = WalkBuilder::new(root)
+            .hidden(true)
+            .require_git(false)
+            .build();
+        for entry in walker.flatten() {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            if path.file_name().and_then(|s| s.to_str()) == Some(".fsearch-index") {
+                continue;
+            }
+            let path_str = path.display().to_string();
+            if !self.files.iter().any(|f| f.path == path_str) {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// 如果 pattern 全是字面量，返回候选文件路径；否则返回 None
     pub fn candidates(&self, pattern: &str) -> Option<Vec<String>> {
-        // 含正则元字符则放弃
         if pattern.chars().any(|c| {
             matches!(
                 c,
@@ -194,7 +239,7 @@ impl Index {
             let tri = [lower[i], lower[i + 1], lower[i + 2]];
             match self.trigrams.get(&tri) {
                 Some(ids) => candidate_sets.push(ids),
-                None => return Some(Vec::new()), // 没有这个 trigram，无候选
+                None => return Some(Vec::new()),
             }
         }
 
@@ -202,7 +247,6 @@ impl Index {
             return Some(Vec::new());
         }
 
-        // 求交集：从最短的集合开始
         candidate_sets.sort_by_key(|s| s.len());
         let mut result: Vec<u32> = candidate_sets[0].clone();
         for s in &candidate_sets[1..] {
@@ -236,6 +280,28 @@ pub fn build_and_save(root: &Path) -> Result<usize> {
     let path = index_path(root);
     index.save(&path)?;
     Ok(index.file_count())
+}
+
+/// 加载索引；不存在或过期则重建
+///
+/// 返回 `(index, rebuilt)`：
+/// - `rebuilt = true` 表示索引被创建或重建
+/// - `rebuilt = false` 表示直接用了磁盘上的旧索引
+pub fn load_or_rebuild(root: &Path) -> Result<(Index, bool)> {
+    let idx_path = index_path(root);
+    if !idx_path.exists() {
+        let idx = Index::build(root)?;
+        idx.save(&idx_path)?;
+        return Ok((idx, true));
+    }
+    let idx = Index::load(&idx_path)?;
+    if idx.is_stale(root) {
+        let new_idx = Index::build(root)?;
+        new_idx.save(&idx_path)?;
+        Ok((new_idx, true))
+    } else {
+        Ok((idx, false))
+    }
 }
 
 #[cfg(test)]
@@ -360,5 +426,71 @@ mod tests {
 
         let index = Index::build(&dir.0).unwrap();
         assert_eq!(index.file_count(), 1);
+    }
+
+    #[test]
+    fn stale_when_file_modified() {
+        let dir = TempDir::new("stale_mod");
+        dir.file("a.txt", "hello\n");
+        let index = Index::build(&dir.0).unwrap();
+        assert!(!index.is_stale(&dir.0));
+
+        // 改内容，size 和 mtime 都会变
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std_fs::write(dir.0.join("a.txt"), "hello world, longer\n").unwrap();
+        assert!(index.is_stale(&dir.0));
+    }
+
+    #[test]
+    fn stale_when_file_deleted() {
+        let dir = TempDir::new("stale_del");
+        let p = dir.file("a.txt", "hello\n");
+        let index = Index::build(&dir.0).unwrap();
+        std_fs::remove_file(&p).unwrap();
+        assert!(index.is_stale(&dir.0));
+    }
+
+    #[test]
+    fn stale_when_new_file_added() {
+        let dir = TempDir::new("stale_add");
+        dir.file("a.txt", "hello\n");
+        let index = Index::build(&dir.0).unwrap();
+        dir.file("b.txt", "new file\n");
+        assert!(index.is_stale(&dir.0));
+    }
+
+    #[test]
+    fn load_or_rebuild_creates_when_missing() {
+        let dir = TempDir::new("lorb_new");
+        dir.file("a.txt", "hello\n");
+
+        let (idx, rebuilt) = load_or_rebuild(&dir.0).unwrap();
+        assert!(rebuilt);
+        assert_eq!(idx.file_count(), 1);
+        assert!(index_path(&dir.0).exists());
+    }
+
+    #[test]
+    fn load_or_rebuild_reuses_when_fresh() {
+        let dir = TempDir::new("lorb_fresh");
+        dir.file("a.txt", "hello\n");
+
+        let (_, _) = load_or_rebuild(&dir.0).unwrap();
+        let (_, rebuilt) = load_or_rebuild(&dir.0).unwrap();
+        assert!(!rebuilt);
+    }
+
+    #[test]
+    fn load_or_rebuild_rebuilds_when_stale() {
+        let dir = TempDir::new("lorb_stale");
+        dir.file("a.txt", "hello\n");
+
+        let (_, _) = load_or_rebuild(&dir.0).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        dir.file("b.txt", "new\n");
+
+        let (idx, rebuilt) = load_or_rebuild(&dir.0).unwrap();
+        assert!(rebuilt);
+        assert_eq!(idx.file_count(), 2);
     }
 }

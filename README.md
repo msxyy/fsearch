@@ -21,7 +21,7 @@
 
 ## 特性
 
-- 正则搜索（`regex` crate）
+- 正则搜索（`regex` crate）+ 字面量预筛（`aho-corasick`）
 - 递归目录 + 自动读取 `.gitignore`
 - 忽略大小写、行号、只列文件名、计数
 - 上下文：`-A` / `-B` / `-C`
@@ -39,7 +39,7 @@
 - `-u` / `-uu` / `-uuu` 逐级放宽忽略规则
 - 递归深度 `--max-depth`、文件大小 `--max-filesize`
 - 静默模式 `-q`
-- 增量索引 `--build-index` / `--use-index`
+- 增量索引 `--build-index` / `--use-index`，索引自动检测过期并重建
 - JSON Lines 输出 `--json`（含 begin/end/summary 事件）
 - Shell 补全生成 `--generate-completions`
 - Man 手册生成 `--generate-man`
@@ -68,6 +68,28 @@ cargo build --release
 
 ```bash
 cargo install --git https://github.com/msxyy/fsearch
+```
+
+### 方式四：作为库依赖
+
+`fsearch` 同时是一个库，可以在你自己的 Rust 项目里依赖：
+
+```toml
+[dependencies]
+fsearch = { git = "https://github.com/msxyy/fsearch" }
+regex = "1"
+```
+
+```rust
+use fsearch::{search_file, SearchOptions};
+use regex::Regex;
+use std::path::Path;
+
+let re = Regex::new("fn main")?;
+let opts = SearchOptions::default();
+let result = search_file(Path::new("src/main.rs"), &re, &opts)?;
+println!("{} 命中 {} 行", result.path, result.match_count);
+# Ok::<(), anyhow::Error>(())
 ```
 
 ## Shell 补全与 man 手册
@@ -124,12 +146,6 @@ fsearch -c "unsafe" ./src
 # 显示匹配行前后各 2 行上下文
 fsearch -C 2 "panic" ./src
 
-# 显示匹配行后 2 行
-fsearch -A 2 "fn main" ./src
-
-# 显示匹配行前 2 行
-fsearch -B 2 "fn main" ./src
-
 # 全词匹配，不会匹配到 define 里的 fn
 fsearch -w "fn" ./src
 
@@ -154,9 +170,6 @@ fsearch --type rust "Result" .
 # 排除 Rust 文件
 fsearch --type-not rust -l "TODO" .
 
-# 只搜匹配 glob 的文件
-fsearch -g "*.toml" "version" .
-
 # 按文件名搜索
 fsearch --name "main" .
 
@@ -169,28 +182,19 @@ fsearch --files-without-match "fn main" ./src
 # 统计匹配次数（每次出现都算一次）
 fsearch --count-matches "fn " ./src
 
-# 每个文件最多输出 1 条匹配
-fsearch -m 1 "fn " ./src
-
 # 输出统计信息
 fsearch --stats "Result" ./src
 
-# 排序输出（并行搜索，按路径排序打印）
+# 排序输出
 fsearch --sort -l "fn " .
 
-# 忽略 .gitignore
-fsearch --no-ignore -l "target" .
-
-# 忽略 .gitignore，且搜索隐藏文件
+# 忽略 .gitignore / 隐藏文件 / 二进制
+fsearch -u -l "target" .
 fsearch -uu "target" .
-
-# 不读 .gitignore，搜隐藏文件，也搜二进制
 fsearch -uuu "fsearch" .
 
-# 限制递归深度
+# 限制递归深度、跳过大于 1MB 的文件
 fsearch --max-depth 1 -l "fn " .
-
-# 跳过大于 1MB 的文件
 fsearch --max-filesize 1M -l "fn " .
 
 # 静默模式，只返回退出码
@@ -203,14 +207,11 @@ fsearch --encoding gbk "中文" .
 # 为目录建立内容索引
 fsearch --build-index ./src
 
-# 使用索引加速搜索（只支持长度 ≥ 3 的字面量）
+# 使用索引加速搜索（索引会自动检测过期并重建）
 fsearch --use-index "fn main" ./src
 
 # JSON Lines 输出
 fsearch --json "fn main" ./src
-
-# 组合：忽略大小写、行号、上下文、只搜 Rust 文件
-fsearch -i -n -C 1 --type rust "result" .
 ```
 
 ## 所有参数
@@ -229,7 +230,7 @@ fsearch -i -n -C 1 --type rust "result" .
 | `-F` / `--fixed` | 把模式当作固定字符串，不解释为正则 |
 | `-o` / `--only-matching` | 只输出匹配部分，而不是整行 |
 | `-r TEXT` / `--replace TEXT` | 把匹配部分替换成 TEXT，输出替换后的行（不写回文件） |
-| `-e PATTERN` / `--regexp PATTERN` | 添加搜索模式，可重复；与位置参数 PATTERN 可同时使用 |
+| `-e PATTERN` / `--regexp PATTERN` | 添加搜索模式，可重复 |
 | `-m N` / `--max-count N` | 每个文件最多输出 N 条匹配 |
 | `-g GLOB` / `--glob` | 只搜索匹配 glob 的文件 |
 | `--type TYPE` | 按文件类型过滤，可重复 |
@@ -341,9 +342,24 @@ fsearch --use-index "Result" ./src
 - 把 pattern 拆成 3-gram，取交集得到候选文件
 - 只在候选文件里做精确正则搜索
 - 只支持**长度 ≥ 3 的字面量 pattern**
-- pattern 含正则元字符（`. * + ? [ ] { } ( ) | ^ $ \`）时自动回退到全量扫描，并打印提示
+- pattern 含正则元字符时自动回退到全量扫描，并打印提示
 
-**注意**：索引不会自动更新。文件内容变化后需要重新运行 `--build-index`。
+**自动更新**：`--use-index` 会检查每个文件的 size 和 mtime，以及目录下是否有新文件。
+索引过期或不存在时会自动重建，不需要手动再跑 `--build-index`。
+
+## 字面量预筛
+
+对 `-F` 或纯字面量 pattern，`fsearch` 会自动启用字面量预筛：
+
+- 用 `aho-corasick` 在每一行上快速检查字面量是否存在
+- 不可能命中的行直接跳过，不跑正则
+- 可能命中的行仍会跑一次正则，保证语义正确
+
+预筛在以下情况自动关闭：
+
+- `-v` 反向匹配（预筛会漏掉应命中的行）
+- `-w` 全词匹配（`\b` 边界不能直接用字面量表达）
+- pattern 含正则元字符且没有 `-F`
 
 ## JSON 输出格式
 
@@ -389,11 +405,13 @@ fsearch --use-index "Result" ./src
 
 ```
 src/
-├── main.rs     # 入口、参数组装、并行遍历
+├── lib.rs      # 库入口，导出所有公共 API
+├── main.rs     # CLI 入口，参数组装、并行遍历
 ├── cli.rs      # clap 参数定义
-├── search.rs   # 单文件流式搜索
+├── pattern.rs  # 正则模式构建、字面量识别
+├── search.rs   # 单文件流式搜索、字面量预筛
 ├── printer.rs  # 输出（普通 / JSON / 静默）
-└── index.rs    # 增量索引（3-gram 倒排表）
+└── index.rs    # 增量索引（3-gram 倒排表、自动更新）
 
 tests/
 └── cli.rs      # 集成测试
@@ -408,10 +426,11 @@ benches/
 cargo test
 ```
 
-包含 **100 个测试**：
+包含 **109 个测试**：
 
-- 60 个单元测试：搜索逻辑、参数组装、JSON 转义、多模式合并、大小解析、索引
-- 40 个集成测试：调用真实 exe，验证端到端行为
+- 67 个库单元测试：搜索逻辑、参数组装、JSON 转义、多模式合并、大小解析、索引、字面量预筛
+- 41 个集成测试：调用真实 exe，验证端到端行为
+- 1 个 doc-test
 
 ## 代码质量
 
@@ -440,7 +459,10 @@ hyperfine --warmup 3 \
   "rg -n 'fn ' ./src"
 ```
 
-`rg` 通常更快，它做了字面量预筛、SIMD、内存映射、并行管线等更激进的优化。`fsearch` 的目标是**功能对等 + 流式内存**，而不是性能击败 `rg`。
+`rg` 通常更快，它做了内存映射、SIMD、更深的并行管线等优化。`fsearch` 现在有字面量预筛和增量索引两条加速路径：
+
+- 一次性搜索：字面量预筛自动启用
+- 反复搜索同一目录：`--build-index` 建索引，之后 `--use-index` 查询只扫候选文件
 
 项目内自带简易 benchmark：
 
@@ -461,14 +483,15 @@ cargo bench
 - **`.gitignore` 生效范围**：即使不在 git 仓库里，也会读取 `.gitignore`（通过 `require_git(false)`）
 - **`--sort` 模式**：并行搜索，收集结果后按路径排序，再串行打印
 - **`-e` 与位置参数**：有 `-e` 时，位置参数被当作路径；无 `-e` 时，位置参数当作模式
-- **增量索引**：3-gram 倒排表，pattern 拆 trigram 取交集得到候选文件，只在候选里做精确搜索
+- **增量索引**：3-gram 倒排表，pattern 拆 trigram 取交集得到候选文件；检查 size 和 mtime 自动判定过期
+- **字面量预筛**：`aho-corasick` 快速排除不可能命中的行；命中后仍跑 regex，保证语义正确
+- **库 + 二进制**：核心逻辑在 `lib.rs`，CLI 只是薄薄一层；第三方可依赖库
 
 ## 后续规划
 
-- [ ] 字面量预筛（`aho-corasick`）提升性能
 - [ ] 配置文件 `.fsearch.toml`
-- [ ] `lib.rs` 拆分，供其他程序依赖
-- [ ] 索引自动更新（基于文件 mtime 判断变化）
+- [ ] 索引支持增量更新（只重建变化的文件）
+- [ ] Windows 原生打包（Inno Setup / WiX）
 
 ## 贡献
 

@@ -1,7 +1,4 @@
 mod cli;
-mod index;
-mod printer;
-mod search;
 
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -14,9 +11,11 @@ use ignore::{overrides::OverrideBuilder, WalkBuilder, WalkState};
 use regex::{Regex, RegexBuilder};
 use std::process::ExitCode;
 
+use fsearch::pattern::{build_combined_pattern, literal_patterns};
+use fsearch::search::FileResult;
+use fsearch::{choose_color, index, JsonPrinter, Output, Prefilter, Printer, SearchOptions};
+
 use crate::cli::Cli;
-use crate::printer::{choose_color, JsonPrinter, Output, Printer};
-use crate::search::{FileResult, SearchOptions};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -25,7 +24,6 @@ enum Mode {
     Files,
 }
 
-/// 排序模式下收集的每个文件的搜索结果
 type CollectedResults = Arc<Mutex<Vec<(String, Option<FileResult>)>>>;
 
 fn main() -> ExitCode {
@@ -77,37 +75,6 @@ fn generate_man() -> Result<()> {
     man.render(&mut buf)?;
     std::io::stdout().write_all(&buf)?;
     Ok(())
-}
-
-pub fn build_pattern(pattern: &str, fixed: bool, word: bool) -> String {
-    let mut p = if fixed {
-        regex::escape(pattern)
-    } else {
-        pattern.to_string()
-    };
-    if word {
-        p = format!(r"\b(?:{})\b", p);
-    }
-    p
-}
-
-pub fn build_combined_pattern(patterns: &[String], fixed: bool, word: bool) -> String {
-    if patterns.is_empty() {
-        return String::new();
-    }
-    if patterns.len() == 1 {
-        return build_pattern(&patterns[0], fixed, word);
-    }
-    let escaped: Vec<String> = patterns
-        .iter()
-        .map(|p| if fixed { regex::escape(p) } else { p.clone() })
-        .collect();
-    let joined = escaped.join("|");
-    if word {
-        format!(r"\b(?:{})\b", joined)
-    } else {
-        format!(r"(?:{})", joined)
-    }
 }
 
 fn extensions_for_type(t: &str) -> Option<&'static [&'static str]> {
@@ -179,7 +146,6 @@ fn parse_size(s: &str) -> Result<u64> {
 fn run() -> Result<bool> {
     let cli = Cli::parse();
 
-    // 隐藏 flag：生成补全 / man
     if let Some(shell) = cli.generate_completions.clone() {
         generate_completions(&shell)?;
         return Ok(true);
@@ -189,7 +155,6 @@ fn run() -> Result<bool> {
         return Ok(true);
     }
 
-    // --build-index <dir>：建立索引后退出
     if let Some(root) = cli.build_index.as_deref() {
         let root_path = std::path::Path::new(root);
         let n = index::build_and_save(root_path)?;
@@ -204,7 +169,6 @@ fn run() -> Result<bool> {
 
     let start = std::time::Instant::now();
 
-    // 模式选择
     let mode = if cli.files {
         Mode::Files
     } else if cli.name {
@@ -213,7 +177,6 @@ fn run() -> Result<bool> {
         Mode::Content
     };
 
-    // 位置参数处理
     let (patterns_opt, path): (Option<Vec<String>>, String) = if mode == Mode::Files {
         let p = if cli.path == "." {
             cli.pattern.clone().unwrap_or_else(|| ".".to_string())
@@ -236,7 +199,6 @@ fn run() -> Result<bool> {
         (Some(pats), cli.path.clone())
     };
 
-    // 构建正则
     let re: Option<Arc<Regex>> = match mode {
         Mode::Files => None,
         _ => {
@@ -286,18 +248,30 @@ fn run() -> Result<bool> {
         cli.replace.clone().map(Arc::new)
     };
 
-    // --use-index：加载索引，得到候选文件列表
+    // 构建字面量预筛器
+    //
+    // 只有满足以下条件时才启用：
+    // - 有 pattern 列表
+    // - 没有 -v（反向匹配时预筛会漏掉应该命中的行）
+    // - pattern 全是字面量（含 -F，或本身不含正则元字符）
+    // - 没有 -w（\b 边界不能直接用字面量表达）
+    let prefilter: Option<Arc<Prefilter>> = if !cli.invert && mode == Mode::Content {
+        patterns_opt.as_ref().and_then(|pats| {
+            literal_patterns(pats, cli.fixed, cli.word)
+                .and_then(|lits| Prefilter::new(&lits, cli.ignore_case))
+                .map(Arc::new)
+        })
+    } else {
+        None
+    };
+
+    // --use-index：加载或自动重建索引
     let candidate_paths: Option<Vec<String>> = if cli.use_index && mode == Mode::Content {
         let root_path = std::path::Path::new(&path);
-        let idx_path = index::index_path(root_path);
-        if !idx_path.exists() {
-            anyhow::bail!(
-                "索引不存在: {}。请先运行 `fsearch --build-index {}`",
-                idx_path.display(),
-                path
-            );
+        let (idx, rebuilt) = index::load_or_rebuild(root_path)?;
+        if rebuilt {
+            eprintln!("fsearch: 索引已建立或更新");
         }
-        let idx = index::Index::load(&idx_path)?;
         match patterns_opt.as_ref().and_then(|v| v.first()) {
             Some(first) => match idx.candidates(first) {
                 Some(c) => Some(c),
@@ -314,7 +288,7 @@ fn run() -> Result<bool> {
         None
     };
 
-    // 遍历器（仅在非索引模式下使用）
+    // 遍历器（非索引模式使用）
     let mut builder = WalkBuilder::new(&path);
     builder
         .hidden(!want_hidden)
@@ -359,7 +333,6 @@ fn run() -> Result<bool> {
         builder.overrides(ob.build()?);
     }
 
-    // 输出
     let color_choice = if cli.json {
         termcolor::ColorChoice::Never
     } else {
@@ -386,7 +359,7 @@ fn run() -> Result<bool> {
     let files_mode = mode == Mode::Files;
 
     if let Some(paths) = candidate_paths {
-        // 索引模式：直接遍历候选文件
+        // 索引模式：只遍历候选文件
         let re_ref = re
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("内部错误：索引模式下正则缺失"))?;
@@ -414,8 +387,9 @@ fn run() -> Result<bool> {
                 search_binary,
                 encoding,
                 replace: replace.as_ref().map(|s| (**s).clone()),
+                prefilter: prefilter.clone(),
             };
-            if let Ok(r) = search::search_file(p, re_ref, &opts) {
+            if let Ok(r) = fsearch::search_file(p, re_ref, &opts) {
                 let interesting = if files_without_match {
                     !r.matched && !r.skipped
                 } else {
@@ -447,6 +421,7 @@ fn run() -> Result<bool> {
         walker.run(|| {
             let re = re.clone();
             let replace = replace.clone();
+            let prefilter = prefilter.clone();
             let collected = Arc::clone(&collected);
             let files_scanned = Arc::clone(&files_scanned);
             let any_found = Arc::clone(&any_found);
@@ -497,8 +472,9 @@ fn run() -> Result<bool> {
                         search_binary,
                         encoding,
                         replace: replace.as_ref().map(|s| (**s).clone()),
+                        prefilter: prefilter.clone(),
                     };
-                    if let Ok(r) = search::search_file(path, re, &opts) {
+                    if let Ok(r) = fsearch::search_file(path, re, &opts) {
                         let interesting = if files_without_match {
                             !r.matched && !r.skipped
                         } else {
@@ -545,6 +521,7 @@ fn run() -> Result<bool> {
         walker.run(|| {
             let re = re.clone();
             let replace = replace.clone();
+            let prefilter = prefilter.clone();
             let shared = Arc::clone(&shared);
             let files_scanned = Arc::clone(&files_scanned);
             let any_found = Arc::clone(&any_found);
@@ -599,8 +576,9 @@ fn run() -> Result<bool> {
                         search_binary,
                         encoding,
                         replace: replace.as_ref().map(|s| (**s).clone()),
+                        prefilter: prefilter.clone(),
                     };
-                    if let Ok(r) = search::search_file(path, re, &opts) {
+                    if let Ok(r) = fsearch::search_file(path, re, &opts) {
                         let interesting = if files_without_match {
                             !r.matched && !r.skipped
                         } else {
@@ -655,173 +633,4 @@ fn run() -> Result<bool> {
     }
 
     Ok(found)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plain_regex_unchanged() {
-        assert_eq!(build_pattern(r"fn\s+main", false, false), r"fn\s+main");
-        assert_eq!(build_pattern(r"\d+", false, false), r"\d+");
-    }
-
-    #[test]
-    fn fixed_escapes_special_chars() {
-        assert_eq!(build_pattern("fn(", true, false), r"fn\(");
-        assert_eq!(build_pattern("a.b*c", true, false), r"a\.b\*c");
-        assert_eq!(build_pattern("a+b?c", true, false), r"a\+b\?c");
-        assert_eq!(build_pattern("[]{}()", true, false), r"\[\]\{\}\(\)");
-    }
-
-    #[test]
-    fn fixed_preserves_normal_chars() {
-        assert_eq!(build_pattern("hello", true, false), "hello");
-        assert_eq!(build_pattern("fn main", true, false), "fn main");
-    }
-
-    #[test]
-    fn word_wraps_with_boundaries() {
-        assert_eq!(build_pattern("fn", false, true), r"\b(?:fn)\b");
-        assert_eq!(build_pattern(r"\d+", false, true), r"\b(?:\d+)\b");
-    }
-
-    #[test]
-    fn fixed_and_word_combined() {
-        assert_eq!(build_pattern("fn(", true, true), r"\b(?:fn\()\b");
-    }
-
-    #[test]
-    fn word_match_whole_word_only() {
-        let p = build_pattern("fn", false, true);
-        let re = Regex::new(&p).unwrap();
-        assert!(re.is_match("fn main"));
-        assert!(re.is_match("let x = fn();"));
-        assert!(!re.is_match("define"));
-        assert!(!re.is_match("fnord"));
-        assert!(!re.is_match("cthulhu_fn"));
-    }
-
-    #[test]
-    fn fixed_matches_literal_paren() {
-        let p = build_pattern("fn(", true, false);
-        let re = Regex::new(&p).unwrap();
-        assert!(re.is_match("fn(x)"));
-        assert!(re.is_match("call fn( now"));
-        assert!(!re.is_match("fn x"));
-    }
-
-    #[test]
-    fn fixed_prevents_regex_interpretation() {
-        let re_plain = Regex::new("a.c").unwrap();
-        assert!(re_plain.is_match("abc"));
-
-        let p = build_pattern("a.c", true, false);
-        let re_fixed = Regex::new(&p).unwrap();
-        assert!(re_fixed.is_match("a.c"));
-        assert!(!re_fixed.is_match("abc"));
-    }
-
-    #[test]
-    fn plain_regex_alternation_still_works() {
-        let p = build_pattern("foo|bar", false, false);
-        assert_eq!(p, "foo|bar");
-        let re = Regex::new(&p).unwrap();
-        assert!(re.is_match("foo"));
-        assert!(re.is_match("bar"));
-    }
-
-    #[test]
-    fn word_with_alternation() {
-        let p = build_pattern("foo|bar", false, true);
-        assert_eq!(p, r"\b(?:foo|bar)\b");
-        let re = Regex::new(&p).unwrap();
-        assert!(re.is_match("foo bar"));
-        assert!(!re.is_match("foobar"));
-    }
-
-    #[test]
-    fn type_extension_lookup() {
-        assert_eq!(extensions_for_type("rust"), Some(&["rs"][..]));
-        assert_eq!(extensions_for_type("py"), Some(&["py", "pyi"][..]));
-        assert_eq!(
-            extensions_for_type("markdown"),
-            Some(&["md", "markdown"][..])
-        );
-        assert!(extensions_for_type("unknown").is_none());
-    }
-
-    #[test]
-    fn encoding_none_returns_none() {
-        assert!(parse_encoding(None).unwrap().is_none());
-    }
-
-    #[test]
-    fn encoding_utf8_label_returns_none() {
-        assert!(parse_encoding(Some("utf-8")).unwrap().is_none());
-        assert!(parse_encoding(Some("UTF-8")).unwrap().is_none());
-    }
-
-    #[test]
-    fn encoding_gbk_returns_some() {
-        let enc = parse_encoding(Some("gbk")).unwrap();
-        assert!(enc.is_some());
-        assert_eq!(enc.unwrap().name(), "GBK");
-    }
-
-    #[test]
-    fn encoding_big5_returns_some() {
-        let enc = parse_encoding(Some("big5")).unwrap();
-        assert!(enc.is_some());
-        assert_eq!(enc.unwrap().name(), "Big5");
-    }
-
-    #[test]
-    fn encoding_unknown_errors() {
-        assert!(parse_encoding(Some("not-a-real-encoding")).is_err());
-    }
-
-    #[test]
-    fn size_bytes() {
-        assert_eq!(parse_size("1024").unwrap(), 1024);
-        assert_eq!(parse_size("1024B").unwrap(), 1024);
-    }
-
-    #[test]
-    fn size_kilo_mega_giga() {
-        assert_eq!(parse_size("10K").unwrap(), 10 * 1024);
-        assert_eq!(parse_size("10k").unwrap(), 10 * 1024);
-        assert_eq!(parse_size("10M").unwrap(), 10 * 1024 * 1024);
-        assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(parse_size("1.5M").unwrap(), (1.5 * 1024.0 * 1024.0) as u64);
-    }
-
-    #[test]
-    fn size_invalid_errors() {
-        assert!(parse_size("abc").is_err());
-    }
-
-    #[test]
-    fn combined_single_pattern() {
-        let pats = vec!["fn".to_string()];
-        assert_eq!(build_combined_pattern(&pats, false, false), "fn");
-        assert_eq!(build_combined_pattern(&pats, false, true), r"\b(?:fn)\b");
-    }
-
-    #[test]
-    fn combined_multiple_patterns() {
-        let pats = vec!["foo".to_string(), "bar".to_string()];
-        assert_eq!(build_combined_pattern(&pats, false, false), r"(?:foo|bar)");
-        assert_eq!(
-            build_combined_pattern(&pats, false, true),
-            r"\b(?:foo|bar)\b"
-        );
-    }
-
-    #[test]
-    fn combined_fixed_escapes_each() {
-        let pats = vec!["a.b".to_string(), "c*d".to_string()];
-        assert_eq!(build_combined_pattern(&pats, true, false), r"(?:a\.b|c\*d)");
-    }
 }

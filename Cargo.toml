@@ -1,6 +1,6 @@
 [package]
 name = "fsearch"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["msxyy"]
 description = "用 Rust 写的文件内容搜索器，ripgrep 简化版"
@@ -12,6 +12,10 @@ keywords = ["search", "grep", "cli", "ripgrep"]
 categories = ["command-line-utilities"]
 exclude = ["/.github", "/benches"]
 
+[lib]
+name = "fsearch"
+path = "src/lib.rs"
+
 [[bin]]
 name = "fsearch"
 path = "src/main.rs"
@@ -21,6 +25,7 @@ name = "search"
 harness = false
 
 [dependencies]
+aho-corasick = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"

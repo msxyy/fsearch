@@ -7,6 +7,28 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-12
+
+### Added
+
+- 拆出 `lib.rs`，`fsearch` 现在同时是一个库，可被其他程序依赖
+- 新增 `pattern` 模块：`build_pattern`、`build_combined_pattern`、`literal_patterns`
+- 字面量预筛（`Prefilter`）：用 `aho-corasick` 快速跳过不可能命中的行，
+  只在可能命中的行上跑正则。对 `-F` 或纯字面量模式自动启用
+- 索引自动更新：`--use-index` 时会检查文件 size 和 mtime，
+  索引过期或不存在时自动重建，不需要手动再跑 `--build-index`
+
+### Changed
+
+- `SearchOptions` 加 `prefilter` 字段；用 `#[derive(Default)]` 提供默认值
+- `SearchOptions` 不再是 `pub struct` 手动实现 `Default`，改用 derive
+- `JsonPrinter` 实现 `Default`
+- 项目结构改为 `lib + bin`，`src/main.rs` 只负责 CLI 和遍历
+
+### Fixed
+
+- 集成测试 `use_index_without_index_errors` 改为验证自动建立索引的新行为
+
 ## [0.4.0] - 2026-10-12
 
 ### Added
@@ -26,7 +48,7 @@
 - `--max-depth N` 限制递归深度
 - `--max-filesize SIZE` 跳过大于指定大小的文件（支持 `10M`、`1G`、`500K`）
 - `-q` / `--quiet` 静默模式，只返回退出码
-- `--generate-completions <SHELL>` 生成 shell 补全脚本（bash / zsh / fish / powershell / elvish）
+- `--generate-completions <SHELL>` 生成 shell 补全脚本
 - `--generate-man` 生成 man 手册页
 
 ### Fixed
@@ -45,7 +67,7 @@
 - `-u` / `-uu` / `-uuu` 逐级放宽忽略规则
 - `--encoding` 指定文件编码（gbk、big5、shift_jis 等）
 - `--type-not` 排除指定文件类型
-- `-r TEXT` / `--replace TEXT` 替换匹配部分，输出替换后的行
+- `-r TEXT` / `--replace TEXT` 替换匹配部分
 - `--sort` 并行搜索但按路径排序输出
 - `--json` 补充 `begin` / `end` / `summary` 事件
 
@@ -70,9 +92,9 @@
 - 并行遍历 + 流式逐行搜索 + 环形缓冲
 - 支持非 UTF-8，跳过二进制文件
 - 退出码：0 找到 / 1 未找到 / 2 出错
-- 47 个测试：31 单元 + 16 集成
 
-[Unreleased]: https://github.com/msxyy/fsearch/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/msxyy/fsearch/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/msxyy/fsearch/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/msxyy/fsearch/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/msxyy/fsearch/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/msxyy/fsearch/compare/v0.1.0...v0.2.0

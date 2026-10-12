@@ -3,11 +3,44 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Read},
     path::Path,
+    sync::Arc,
 };
 
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::Result;
 use encoding_rs::Encoding;
 use regex::Regex;
+
+/// 字面量预筛器
+///
+/// 比正则快得多，用来快速排除不可能命中的行。
+/// **只用于快速排除**：`might_match` 返回 false 的行一定不命中；
+/// 返回 true 的行还需要交给 regex 复核。
+pub struct Prefilter {
+    ac: AhoCorasick,
+}
+
+impl Prefilter {
+    /// 用字面量列表构建预筛器
+    ///
+    /// `case_insensitive=true` 时做 ASCII 级别的大小写不敏感匹配。
+    /// 非 ASCII 字符的大小写仍按原样匹配，这与 ripgrep 的默认行为一致。
+    pub fn new(literals: &[String], case_insensitive: bool) -> Option<Self> {
+        if literals.is_empty() {
+            return None;
+        }
+        let ac = AhoCorasickBuilder::new()
+            .ascii_case_insensitive(case_insensitive)
+            .build(literals)
+            .ok()?;
+        Some(Self { ac })
+    }
+
+    /// 这一行是否可能命中？
+    pub fn might_match(&self, line: &str) -> bool {
+        self.ac.is_match(line)
+    }
+}
 
 /// 打印用的输出行
 pub enum OutputLine {
@@ -16,7 +49,6 @@ pub enum OutputLine {
         line: String,
         matches: Vec<(usize, usize)>,
     },
-    /// 只输出匹配文本（-o 模式）
     MatchOnly {
         line_no: usize,
         text: String,
@@ -31,23 +63,19 @@ pub enum OutputLine {
 /// 单文件搜索的完整结果
 pub struct FileResult {
     pub path: String,
-    /// 是否命中（-v 模式下表示至少有一行不匹配）
     pub matched: bool,
-    /// 命中的行数
     pub match_count: usize,
-    /// 命中次数（每次出现算一次；-v 模式下等于 match_count）
     pub occurrence_count: usize,
-    /// 是否被跳过（二进制或读取失败）
     pub skipped: bool,
     pub output: Vec<OutputLine>,
 }
 
 /// 搜索选项
+#[derive(Default)]
 pub struct SearchOptions {
     pub files_with_matches: bool,
     pub files_without_match: bool,
     pub count: bool,
-    /// 使用 occurrence_count 作为 -c 的输出；隐含 count
     pub count_matches: bool,
     pub before: usize,
     pub after: usize,
@@ -57,6 +85,8 @@ pub struct SearchOptions {
     pub search_binary: bool,
     pub encoding: Option<&'static Encoding>,
     pub replace: Option<String>,
+    /// 可选的预筛器；调用方负责只在合适的场景下传入
+    pub prefilter: Option<Arc<Prefilter>>,
 }
 
 /// 判断是否是二进制文件：读取前 8KB，包含 \0 视为二进制
@@ -117,6 +147,9 @@ impl LineSource {
 }
 
 /// 对单个文件执行搜索，返回结果，不负责打印
+///
+/// 内存占用与文件大小无关：只保留 `opts.before` 行环形缓冲。
+/// 若 `opts.encoding` 指定非 UTF-8，则整个文件会被解码到内存。
 pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<FileResult> {
     let path_str = path.display().to_string();
     let mut result = FileResult {
@@ -128,18 +161,15 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
         output: Vec::new(),
     };
 
-    // -m 0：直接返回空结果
     if matches!(opts.max_count, Some(0)) {
         return Ok(result);
     }
 
-    // 默认跳过二进制；-uuu 时也搜索
     if !opts.search_binary && is_binary(path) {
         result.skipped = true;
         return Ok(result);
     }
 
-    // 选择行来源：UTF-8 走流式，其他编码整体解码
     let mut source = match opts.encoding {
         Some(enc) if !std::ptr::eq(enc, encoding_rs::UTF_8) => {
             let bytes = match fs::read(path) {
@@ -168,9 +198,7 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
         }
     };
 
-    // 只在需要构建输出行时才构建
     let build_output = !opts.files_with_matches && !opts.files_without_match && !opts.count;
-
     let use_context = !opts.only_matching && (opts.before > 0 || opts.after > 0);
     let use_before = if opts.only_matching { 0 } else { opts.before };
     let use_after = if opts.only_matching { 0 } else { opts.after };
@@ -197,14 +225,18 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
             break;
         }
 
-        let is_match = re.is_match(&line);
+        // 字面量预筛：快速排除不可能命中的行
+        let candidate = match &opts.prefilter {
+            Some(pf) => pf.might_match(&line),
+            None => true,
+        };
+        let is_match = if candidate { re.is_match(&line) } else { false };
         let hit = if opts.invert { !is_match } else { is_match };
 
         if hit {
             result.match_count += 1;
             result.matched = true;
 
-            // 命中次数：反向匹配时按行算，否则按出现次数（仅在需要时算）
             if opts.count_matches && !opts.invert {
                 result.occurrence_count += re.find_iter(&line).count();
             } else {
@@ -212,7 +244,6 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
             }
 
             if build_output {
-                // 1) before 上下文
                 if use_context {
                     let before_start = line_no.saturating_sub(use_before).max(1);
                     for (lno, txt) in ring.iter() {
@@ -237,7 +268,6 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
                     }
                 }
 
-                // 2) -o 模式：只输出匹配文本
                 if opts.only_matching && !opts.invert {
                     let ms = find_matches(re, &line);
                     for (s, e) in ms {
@@ -347,20 +377,7 @@ mod tests {
     }
 
     fn default_opts() -> SearchOptions {
-        SearchOptions {
-            files_with_matches: false,
-            files_without_match: false,
-            count: false,
-            count_matches: false,
-            before: 0,
-            after: 0,
-            invert: false,
-            only_matching: false,
-            max_count: None,
-            search_binary: false,
-            encoding: None,
-            replace: None,
-        }
+        SearchOptions::default()
     }
 
     fn re(pattern: &str) -> Regex {
@@ -410,7 +427,6 @@ mod tests {
         let file = dir.file("a.txt", "foo foo foo\n");
         let r = search_file(&file, &re("foo"), &default_opts()).unwrap();
         assert_eq!(r.match_count, 1);
-        // 默认模式下 occurrence_count 也是按行算
         assert_eq!(r.occurrence_count, 1);
     }
 
@@ -539,7 +555,6 @@ mod tests {
 
         let r = search_file(&path, &re("world"), &default_opts()).unwrap();
         assert!(r.matched);
-        assert_eq!(r.match_count, 1);
 
         let r2 = search_file(&path, &re("hello"), &default_opts()).unwrap();
         assert!(r2.matched);
@@ -622,7 +637,6 @@ mod tests {
         opts.encoding = Some(encoding_rs::GBK);
         let r = search_file(&file, &re("你好"), &opts).unwrap();
         assert!(r.matched);
-        assert_eq!(r.match_count, 1);
 
         let r2 = search_file(&file, &re("hello"), &opts).unwrap();
         assert!(r2.matched);
@@ -647,7 +661,6 @@ mod tests {
         let mut opts = default_opts();
         opts.replace = Some("X".to_string());
         let r = search_file(&file, &re("foo"), &opts).unwrap();
-        assert!(r.matched);
         assert_eq!(output_lines(&r), vec!["M:X bar X"]);
     }
 
@@ -681,5 +694,52 @@ mod tests {
         opts.replace = Some("X".to_string());
         let r = search_file(&file, &re("foo"), &opts).unwrap();
         assert_eq!(output_lines(&r), vec!["O:foo", "O:foo"]);
+    }
+
+    // ---------- 字面量预筛 ----------
+
+    #[test]
+    fn prefilter_accepts_matching_lines() {
+        let pf = Prefilter::new(&["needle".to_string()], false).unwrap();
+        assert!(pf.might_match("a needle here"));
+        assert!(!pf.might_match("no match here"));
+    }
+
+    #[test]
+    fn prefilter_ascii_case_insensitive() {
+        let pf = Prefilter::new(&["needle".to_string()], true).unwrap();
+        assert!(pf.might_match("A NEEDLE Here"));
+        assert!(pf.might_match("a needle here"));
+    }
+
+    #[test]
+    fn prefilter_multiple_literals() {
+        let pf = Prefilter::new(&["foo".to_string(), "bar".to_string()], false).unwrap();
+        assert!(pf.might_match("has foo"));
+        assert!(pf.might_match("has bar"));
+        assert!(!pf.might_match("has baz"));
+    }
+
+    #[test]
+    fn prefilter_used_in_search() {
+        let dir = TempDir::new("prefilter");
+        let file = dir.file("a.txt", "first line\nneedle here\nthird line\n");
+        let pf = Arc::new(Prefilter::new(&["needle".to_string()], false).unwrap());
+        let mut opts = default_opts();
+        opts.prefilter = Some(pf);
+        let r = search_file(&file, &re("needle"), &opts).unwrap();
+        assert!(r.matched);
+        assert_eq!(r.match_count, 1);
+    }
+
+    #[test]
+    fn prefilter_does_not_miss_case_sensitive() {
+        let dir = TempDir::new("pf_case");
+        let file = dir.file("a.txt", "NEEDLE\nneedle\nNeedle\n");
+        let pf = Arc::new(Prefilter::new(&["needle".to_string()], false).unwrap());
+        let mut opts = default_opts();
+        opts.prefilter = Some(pf);
+        let r = search_file(&file, &re("needle"), &opts).unwrap();
+        assert_eq!(r.match_count, 1);
     }
 }

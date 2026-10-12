@@ -392,6 +392,12 @@ impl JsonPrinter {
     }
 }
 
+impl Default for JsonPrinter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
