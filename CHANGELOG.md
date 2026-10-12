@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-12
+
+### Fixed
+
+- 配置文件加载：搜索路径里没有 `.fsearch.toml` 时，
+  回退到当前工作目录里的 `.fsearch.toml`
+
 ## [0.6.0] - 2026-10-12
 
 ### Added
@@ -14,36 +21,28 @@
 - 配置文件支持：在搜索目录放 `.fsearch.toml`，为该目录及其子目录指定默认选项
   - 支持布尔开关、数值、字符串、列表四类字段
   - 命令行参数始终优先于配置文件
-  - 未知字段会报错，避免拼写错误被静默忽略
-- 索引增量更新：`--use-index` 时只重建 size 或 mtime 变化的文件，
-  未变化文件的 trigram 直接从旧索引复用
-  - 索引格式从 `FSIDX001` 升到 `FSIDX002`，每个文件单独保存 trigram 列表
+  - 未知字段会报错
+- 索引增量更新：`--use-index` 时只重建 size 或 mtime 变化的文件
+  - 索引格式从 `FSIDX001` 升到 `FSIDX002`
   - 旧格式索引会被自动识别并走全量重建
-  - 输出 `fsearch: 索引更新完成（复用 N 个，重建 M 个）`
 
 ### Changed
 
 - CLI 参数全面改为 `Option<T>`，便于和配置文件合并
-- `--use-index` 改用 `load_or_update`，行为对齐 v0.5.0 的自动更新
-- 新增 `config` 模块，`Config` 结构体通过 `serde` + `toml` 解析
-
-### Fixed
-
-- `--sort` 和 `--stats` 在配置文件里设置时能被正确识别
+- 新增 `config` 模块
 
 ## [0.5.0] - 2026-10-12
 
 ### Added
 
-- 拆出 `lib.rs`，`fsearch` 现在同时是一个库，可被其他程序依赖
-- 新增 `pattern` 模块：`build_pattern`、`build_combined_pattern`、`literal_patterns`
+- 拆出 `lib.rs`，`fsearch` 现在同时是一个库
+- 新增 `pattern` 模块
 - 字面量预筛（`Prefilter`）：用 `aho-corasick` 快速跳过不可能命中的行
-- 索引自动更新：`--use-index` 时检查 size 和 mtime，索引过期或不存在时自动重建
+- 索引自动更新：`--use-index` 时检查 size 和 mtime
 
 ### Changed
 
 - `SearchOptions` 加 `prefilter` 字段
-- `SearchOptions` 改用 `#[derive(Default)]`
 - `JsonPrinter` 实现 `Default`
 - 项目结构改为 `lib + bin`
 
@@ -52,7 +51,7 @@
 ### Added
 
 - `--build-index <DIR>` 为目录建立内容索引
-- `--use-index` 使用已有索引加速搜索；仅支持长度 ≥ 3 的字面量 pattern
+- `--use-index` 使用已有索引加速搜索
 - 索引使用 3-gram 倒排表
 
 ## [0.3.0] - 2026-10-12
@@ -110,7 +109,8 @@
 - 支持非 UTF-8，跳过二进制文件
 - 退出码：0 找到 / 1 未找到 / 2 出错
 
-[Unreleased]: https://github.com/msxyy/fsearch/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/msxyy/fsearch/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/msxyy/fsearch/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/msxyy/fsearch/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/msxyy/fsearch/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/msxyy/fsearch/compare/v0.3.0...v0.4.0

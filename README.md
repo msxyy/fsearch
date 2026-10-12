@@ -95,7 +95,13 @@ println!("{} 命中 {} 行", result.path, result.match_count);
 
 ## 配置文件
 
-在搜索目录放一个 `.fsearch.toml`，为该目录及其子目录指定默认选项。命令行参数始终优先于配置文件。
+在**搜索目录**或**当前工作目录**放一个 `.fsearch.toml`，为该目录及其子目录指定默认选项。命令行参数始终优先于配置文件。
+
+加载顺序：
+
+1. 搜索路径里有 `.fsearch.toml` → 用它
+2. 没有 → 用当前工作目录的 `.fsearch.toml`
+3. 都没有 → 空配置
 
 ```toml
 # .fsearch.toml

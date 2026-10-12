@@ -202,7 +202,7 @@ fn run() -> Result<bool> {
     };
 
     // 加载配置文件
-    let cfg = Config::load(Path::new(&path))?;
+    let cfg = Config::load_with_cwd(Path::new(&path))?;
 
     // 合并 CLI 与配置文件：CLI 优先
     let ignore_case = cli.ignore_case.or(cfg.ignore_case).unwrap_or(false);

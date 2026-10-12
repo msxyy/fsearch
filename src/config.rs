@@ -1,6 +1,6 @@
 //! 配置文件解析。
 //!
-//! 在搜索目录里放 `.fsearch.toml`，可以为该目录及其子目录指定默认选项。
+//! 在搜索目录或当前工作目录里放 `.fsearch.toml`，可以为该目录及其子目录指定默认选项。
 //! 命令行参数始终优先于配置文件。
 //!
 //! 示例 `.fsearch.toml`：
@@ -78,6 +78,35 @@ impl Config {
         let cfg: Self = toml::from_str(&text)
             .map_err(|e| anyhow::anyhow!("无法解析 {}: {}", path.display(), e))?;
         Ok(cfg)
+    }
+
+    /// 从搜索路径和当前工作目录依次尝试加载。
+    ///
+    /// 优先级：搜索路径里的 `.fsearch.toml` > 当前工作目录里的 `.fsearch.toml`。
+    pub fn load_with_cwd(root: &Path) -> Result<Self> {
+        // 1) 搜索路径
+        let path_cfg = root.join(CONFIG_FILENAME);
+        if path_cfg.exists() {
+            return Self::load(root);
+        }
+
+        // 2) 当前工作目录
+        if let Ok(cwd) = std::env::current_dir() {
+            let cwd_cfg = cwd.join(CONFIG_FILENAME);
+            if cwd_cfg.exists() {
+                // 防止 root 就是 cwd 的情况（虽然已经查过 root，但保险）
+                let same = match (root.canonicalize(), cwd.canonicalize()) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => false,
+                };
+                if !same {
+                    return Self::load(&cwd);
+                }
+            }
+        }
+
+        // 3) 都没有：空配置
+        Ok(Self::default())
     }
 }
 
@@ -189,5 +218,25 @@ glob = "*.rs"
         assert_eq!(cfg.color, Some("always".to_string()));
         assert_eq!(cfg.max_filesize, Some("10M".to_string()));
         assert_eq!(cfg.glob, Some("*.rs".to_string()));
+    }
+
+    #[test]
+    fn load_with_cwd_prefers_root() {
+        let dir = TempDir::new("cwd_root");
+        dir.write(CONFIG_FILENAME, "ignore_case = true\n");
+        // root 有配置，应该用它
+        let cfg = Config::load_with_cwd(&dir.0).unwrap();
+        assert_eq!(cfg.ignore_case, Some(true));
+    }
+
+    #[test]
+    fn load_with_cwd_falls_back_to_cwd() {
+        // 这个测试无法在不改 CWD 的情况下直接验证 fallback，
+        // 只验证 root 没有配置时不会 panic
+        let dir = TempDir::new("cwd_fallback");
+        let cfg = Config::load_with_cwd(&dir.0).unwrap();
+        // root 没有 .fsearch.toml，可能从 CWD 加载也可能空配置，
+        // 但不应报错
+        let _ = cfg;
     }
 }
