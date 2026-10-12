@@ -7,6 +7,15 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-12
+
+### Added
+
+- `--build-index <DIR>` 为目录建立内容索引，保存到 `<DIR>/.fsearch-index`
+- `--use-index` 使用已有索引加速搜索；仅支持长度 ≥ 3 的字面量 pattern，
+  含正则元字符时自动回退到全量扫描
+- 索引使用 3-gram 倒排表，只对候选文件做精确搜索
+
 ## [0.3.0] - 2026-10-12
 
 ### Added
@@ -63,7 +72,8 @@
 - 退出码：0 找到 / 1 未找到 / 2 出错
 - 47 个测试：31 单元 + 16 集成
 
-[Unreleased]: https://github.com/msxyy/fsearch/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/msxyy/fsearch/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/msxyy/fsearch/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/msxyy/fsearch/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/msxyy/fsearch/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/msxyy/fsearch/releases/tag/v0.1.0

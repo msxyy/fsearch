@@ -151,6 +151,14 @@ pub struct Cli {
     #[arg(short = 'g', long)]
     pub glob: Option<String>,
 
+    /// 为指定目录建立/更新内容索引，保存到 <DIR>/.fsearch-index
+    #[arg(long = "build-index", value_name = "DIR")]
+    pub build_index: Option<String>,
+
+    /// 使用已有索引加速搜索（仅支持字面量 pattern，长度至少 3）
+    #[arg(long)]
+    pub use_index: bool,
+
     /// 生成 shell 补全脚本到 stdout（bash / zsh / fish / powershell / elvish）
     #[arg(long, hide = true, value_name = "SHELL")]
     pub generate_completions: Option<String>,

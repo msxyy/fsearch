@@ -814,3 +814,85 @@ fn generate_man_page() {
     // man 页通常以 .TH 开头
     assert!(stdout.contains(".TH") || stdout.contains("FSEARCH"));
 }
+
+// ---------- v0.4.0：增量索引 ----------
+
+#[test]
+fn build_index_then_use_index() {
+    let dir = TempDir::new("idx_e2e");
+    dir.file("a.txt", "hello world\n");
+    dir.file("b.txt", "foo bar\n");
+
+    // 建立索引
+    let out = fsearch()
+        .arg("--build-index")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "build stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // 使用索引搜索
+    let out = fsearch()
+        .arg("--use-index")
+        .arg("hello")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "use stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("hello"), "stdout: {stdout}");
+    assert!(!stdout.contains("foo bar"), "stdout: {stdout}");
+}
+
+#[test]
+fn use_index_without_index_errors() {
+    let dir = TempDir::new("idx_missing");
+    dir.file("a.txt", "hello\n");
+
+    let out = fsearch()
+        .arg("--use-index")
+        .arg("hello")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("索引") || stderr.contains("index"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn use_index_with_regex_falls_back() {
+    let dir = TempDir::new("idx_regex");
+    dir.file("a.txt", "hello world\n");
+
+    let out = fsearch()
+        .arg("--build-index")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // 含正则元字符，会回退到全量扫描
+    let out = fsearch()
+        .arg("--use-index")
+        .arg("hel.*o")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("回退"), "stderr: {stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("hello"));
+}

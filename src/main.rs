@@ -1,4 +1,5 @@
 mod cli;
+mod index;
 mod printer;
 mod search;
 
@@ -43,7 +44,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// 生成 shell 补全脚本到 stdout
 fn generate_completions(shell: &str) -> Result<()> {
     use clap::CommandFactory;
     use clap_complete::{generate, shells};
@@ -66,7 +66,6 @@ fn generate_completions(shell: &str) -> Result<()> {
     Ok(())
 }
 
-/// 生成 man 手册页到 stdout
 fn generate_man() -> Result<()> {
     use clap::CommandFactory;
     use clap_mangen::Man;
@@ -80,7 +79,6 @@ fn generate_man() -> Result<()> {
     Ok(())
 }
 
-/// 根据 -F / -w 组装单个模式的最终正则字符串
 pub fn build_pattern(pattern: &str, fixed: bool, word: bool) -> String {
     let mut p = if fixed {
         regex::escape(pattern)
@@ -93,10 +91,6 @@ pub fn build_pattern(pattern: &str, fixed: bool, word: bool) -> String {
     p
 }
 
-/// 把多个模式合并成一个正则字符串
-///
-/// - 单模式：等价于 `build_pattern`
-/// - 多模式：用 `|` 连接，非 `-w` 时用 `(?:...)` 包裹
 pub fn build_combined_pattern(patterns: &[String], fixed: bool, word: bool) -> String {
     if patterns.is_empty() {
         return String::new();
@@ -116,7 +110,6 @@ pub fn build_combined_pattern(patterns: &[String], fixed: bool, word: bool) -> S
     }
 }
 
-/// 把 --type / --type-not 映射到扩展名列表
 fn extensions_for_type(t: &str) -> Option<&'static [&'static str]> {
     Some(match t {
         "rust" | "rs" => &["rs"],
@@ -149,7 +142,6 @@ fn extensions_for_type(t: &str) -> Option<&'static [&'static str]> {
     })
 }
 
-/// 解析 --encoding 参数
 fn parse_encoding(name: Option<&str>) -> Result<Option<&'static encoding_rs::Encoding>> {
     let name = match name {
         None => return Ok(None),
@@ -165,7 +157,6 @@ fn parse_encoding(name: Option<&str>) -> Result<Option<&'static encoding_rs::Enc
     }
 }
 
-/// 解析 --max-filesize，如 10M、1G、500K、1024
 fn parse_size(s: &str) -> Result<u64> {
     let s = s.trim();
     let (num_str, mult) = if let Some(n) = s.strip_suffix(['K', 'k']) {
@@ -188,7 +179,7 @@ fn parse_size(s: &str) -> Result<u64> {
 fn run() -> Result<bool> {
     let cli = Cli::parse();
 
-    // 处理 --generate-completions / --generate-man（隐藏 flag）
+    // 隐藏 flag：生成补全 / man
     if let Some(shell) = cli.generate_completions.clone() {
         generate_completions(&shell)?;
         return Ok(true);
@@ -198,9 +189,22 @@ fn run() -> Result<bool> {
         return Ok(true);
     }
 
+    // --build-index <dir>：建立索引后退出
+    if let Some(root) = cli.build_index.as_deref() {
+        let root_path = std::path::Path::new(root);
+        let n = index::build_and_save(root_path)?;
+        let idx_path = index::index_path(root_path);
+        eprintln!(
+            "fsearch: 已索引 {} 个文件，保存到 {}",
+            n,
+            idx_path.display()
+        );
+        return Ok(true);
+    }
+
     let start = std::time::Instant::now();
 
-    // 选择模式
+    // 模式选择
     let mode = if cli.files {
         Mode::Files
     } else if cli.name {
@@ -209,11 +213,7 @@ fn run() -> Result<bool> {
         Mode::Content
     };
 
-    // 处理位置参数歧义：
-    // - --files 模式：唯一位置参数当作 path
-    // - 有 -e / --regexp：位置参数当作 path（第一个位置参数会被 clap 分配给
-    //   pattern，所以需要把 cli.pattern 当成 path）
-    // - 否则：第一个位置参数当模式，第二个当路径
+    // 位置参数处理
     let (patterns_opt, path): (Option<Vec<String>>, String) = if mode == Mode::Files {
         let p = if cli.path == "." {
             cli.pattern.clone().unwrap_or_else(|| ".".to_string())
@@ -222,12 +222,9 @@ fn run() -> Result<bool> {
         };
         (None, p)
     } else if !cli.patterns.is_empty() {
-        // 有 -e：位置参数是路径
         let search_path = if cli.path != "." {
-            // 两个位置参数都给了：用最后一个当路径
             cli.path.clone()
         } else {
-            // 只有一个位置参数，被 clap 分给了 pattern
             cli.pattern.clone().unwrap_or_else(|| ".".to_string())
         };
         (Some(cli.patterns.clone()), search_path)
@@ -239,7 +236,7 @@ fn run() -> Result<bool> {
         (Some(pats), cli.path.clone())
     };
 
-    // 校验并构建正则
+    // 构建正则
     let re: Option<Arc<Regex>> = match mode {
         Mode::Files => None,
         _ => {
@@ -258,11 +255,9 @@ fn run() -> Result<bool> {
         }
     };
 
-    // before / after 优先级：-A/-B 覆盖 -C
     let before = cli.before.unwrap_or(cli.context);
     let after = cli.after.unwrap_or(cli.context);
 
-    // -u / -uu / -uuu 逐级放宽
     let no_ignore = cli.no_ignore || cli.unrestricted >= 1;
     let want_hidden = cli.hidden || cli.unrestricted >= 2;
     let search_binary = cli.unrestricted >= 3;
@@ -276,12 +271,10 @@ fn run() -> Result<bool> {
     let sort_output = cli.sort;
     let quiet = cli.quiet;
 
-    // count_matches 隐含 count
     let count = cli.count || cli.count_matches;
     let count_matches = cli.count_matches;
     let files_without_match = cli.files_without_match;
 
-    // 替换只对普通匹配输出生效
     let replace: Option<Arc<String>> = if cli.json
         || cli.files_with_matches
         || files_without_match
@@ -293,7 +286,35 @@ fn run() -> Result<bool> {
         cli.replace.clone().map(Arc::new)
     };
 
-    // 遍历器
+    // --use-index：加载索引，得到候选文件列表
+    let candidate_paths: Option<Vec<String>> = if cli.use_index && mode == Mode::Content {
+        let root_path = std::path::Path::new(&path);
+        let idx_path = index::index_path(root_path);
+        if !idx_path.exists() {
+            anyhow::bail!(
+                "索引不存在: {}。请先运行 `fsearch --build-index {}`",
+                idx_path.display(),
+                path
+            );
+        }
+        let idx = index::Index::load(&idx_path)?;
+        match patterns_opt.as_ref().and_then(|v| v.first()) {
+            Some(first) => match idx.candidates(first) {
+                Some(c) => Some(c),
+                None => {
+                    eprintln!(
+                        "fsearch: pattern 含正则元字符或长度不足 3，索引模式仅支持字面量搜索，回退到全量扫描"
+                    );
+                    None
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    // 遍历器（仅在非索引模式下使用）
     let mut builder = WalkBuilder::new(&path);
     builder
         .hidden(!want_hidden)
@@ -352,7 +373,6 @@ fn run() -> Result<bool> {
         Output::Plain(Printer::new(color_choice, cli.line_number))
     };
 
-    // 共享统计
     let any_found = Arc::new(AtomicBool::new(false));
     let files_scanned = Arc::new(AtomicUsize::new(0));
     let files_matched = Arc::new(AtomicUsize::new(0));
@@ -365,8 +385,62 @@ fn run() -> Result<bool> {
     let name_mode = mode == Mode::Name;
     let files_mode = mode == Mode::Files;
 
-    if sort_output {
-        // 并行搜索，收集结果后按路径排序，再串行打印
+    if let Some(paths) = candidate_paths {
+        // 索引模式：直接遍历候选文件
+        let re_ref = re
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("内部错误：索引模式下正则缺失"))?;
+        let shared = Arc::new(Mutex::new(output));
+        for path_str in &paths {
+            files_scanned.fetch_add(1, Ordering::Relaxed);
+            let p = std::path::Path::new(path_str);
+            if let Some(max) = max_filesize {
+                if let Ok(meta) = std::fs::metadata(p) {
+                    if meta.len() > max {
+                        continue;
+                    }
+                }
+            }
+            let opts = SearchOptions {
+                files_with_matches,
+                files_without_match,
+                count,
+                count_matches,
+                before,
+                after,
+                invert,
+                only_matching,
+                max_count,
+                search_binary,
+                encoding,
+                replace: replace.as_ref().map(|s| (**s).clone()),
+            };
+            if let Ok(r) = search::search_file(p, re_ref, &opts) {
+                let interesting = if files_without_match {
+                    !r.matched && !r.skipped
+                } else {
+                    r.matched
+                };
+                if interesting {
+                    any_found.store(true, Ordering::Relaxed);
+                    files_matched.fetch_add(1, Ordering::Relaxed);
+                    if r.matched {
+                        total_matches.fetch_add(r.match_count, Ordering::Relaxed);
+                    }
+                    let mut out = shared.lock().unwrap();
+                    if files_without_match {
+                        let _ = out.print_filename_only(path_str);
+                    } else {
+                        let _ = out.print_file_result(&r, files_with_matches, count, count_matches);
+                    }
+                }
+            }
+        }
+        output = Arc::try_unwrap(shared)
+            .map_err(|_| anyhow::anyhow!("内部错误：输出锁未释放"))?
+            .into_inner()
+            .unwrap();
+    } else if sort_output {
         let collected: CollectedResults = Arc::new(Mutex::new(Vec::new()));
 
         let walker = builder.build_parallel();
@@ -465,7 +539,6 @@ fn run() -> Result<bool> {
             }
         }
     } else {
-        // 并行搜索，边搜边打印
         let shared = Arc::new(Mutex::new(output));
 
         let walker = builder.build_parallel();

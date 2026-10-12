@@ -39,6 +39,7 @@
 - `-u` / `-uu` / `-uuu` 逐级放宽忽略规则
 - 递归深度 `--max-depth`、文件大小 `--max-filesize`
 - 静默模式 `-q`
+- 增量索引 `--build-index` / `--use-index`
 - JSON Lines 输出 `--json`（含 begin/end/summary 事件）
 - Shell 补全生成 `--generate-completions`
 - Man 手册生成 `--generate-man`
@@ -199,6 +200,12 @@ echo $LASTEXITCODE
 # 搜 GBK 编码的文件
 fsearch --encoding gbk "中文" .
 
+# 为目录建立内容索引
+fsearch --build-index ./src
+
+# 使用索引加速搜索（只支持长度 ≥ 3 的字面量）
+fsearch --use-index "fn main" ./src
+
 # JSON Lines 输出
 fsearch --json "fn main" ./src
 
@@ -232,6 +239,8 @@ fsearch -i -n -C 1 --type rust "result" .
 | `--files-without-match` | 列出不含匹配的文件（`-l` 的反向） |
 | `--count-matches` | 统计匹配次数（每次出现都算一次）；隐含 `-c` |
 | `--sort` | 并行搜索但输出按路径排序 |
+| `--build-index DIR` | 为目录建立内容索引，保存到 `<DIR>/.fsearch-index` |
+| `--use-index` | 使用已有索引加速搜索（仅支持长度 ≥ 3 的字面量） |
 | `--json` | 以 JSON Lines 格式输出 |
 | `--stats` | 输出统计信息（扫描文件数、匹配数、耗时） |
 | `--encoding ENC` | 指定文件编码，如 gbk、big5、shift_jis |
@@ -308,6 +317,34 @@ fsearch -i -n -C 1 --type rust "result" .
 
 指定非 UTF-8 编码时，整个文件会被解码到内存再搜索；默认 UTF-8 走流式，内存占用与文件大小无关。
 
+## 增量索引
+
+对固定目录反复搜索时，可以预先建立索引，后续搜索只扫描可能命中的文件。
+
+```bash
+# 首次：建立索引
+fsearch --build-index ./src
+# 输出：fsearch: 已索引 4 个文件，保存到 ./src/.fsearch-index
+
+# 之后：使用索引
+fsearch --use-index "fn main" ./src
+fsearch --use-index "Result" ./src
+```
+
+索引文件保存在目标目录下的 `.fsearch-index`，是一个二进制文件，包含：
+
+- 所有非二进制、非空文件的路径、大小、修改时间
+- 从文件内容提取的所有 3-gram（三字节序列）到文件 ID 的倒排表
+
+搜索时：
+
+- 把 pattern 拆成 3-gram，取交集得到候选文件
+- 只在候选文件里做精确正则搜索
+- 只支持**长度 ≥ 3 的字面量 pattern**
+- pattern 含正则元字符（`. * + ? [ ] { } ( ) | ^ $ \`）时自动回退到全量扫描，并打印提示
+
+**注意**：索引不会自动更新。文件内容变化后需要重新运行 `--build-index`。
+
 ## JSON 输出格式
 
 `--json` 模式下每行一个独立的 JSON 对象，方便被工具或脚本逐行解析。
@@ -355,7 +392,8 @@ src/
 ├── main.rs     # 入口、参数组装、并行遍历
 ├── cli.rs      # clap 参数定义
 ├── search.rs   # 单文件流式搜索
-└── printer.rs  # 输出（普通 / JSON / 静默）
+├── printer.rs  # 输出（普通 / JSON / 静默）
+└── index.rs    # 增量索引（3-gram 倒排表）
 
 tests/
 └── cli.rs      # 集成测试
@@ -370,10 +408,10 @@ benches/
 cargo test
 ```
 
-包含 **89 个测试**：
+包含 **100 个测试**：
 
-- 52 个单元测试：搜索逻辑、参数组装、JSON 转义、多模式合并、大小解析
-- 37 个集成测试：调用真实 exe，验证端到端行为
+- 60 个单元测试：搜索逻辑、参数组装、JSON 转义、多模式合并、大小解析、索引
+- 40 个集成测试：调用真实 exe，验证端到端行为
 
 ## 代码质量
 
@@ -423,13 +461,14 @@ cargo bench
 - **`.gitignore` 生效范围**：即使不在 git 仓库里，也会读取 `.gitignore`（通过 `require_git(false)`）
 - **`--sort` 模式**：并行搜索，收集结果后按路径排序，再串行打印
 - **`-e` 与位置参数**：有 `-e` 时，位置参数被当作路径；无 `-e` 时，位置参数当作模式
+- **增量索引**：3-gram 倒排表，pattern 拆 trigram 取交集得到候选文件，只在候选里做精确搜索
 
 ## 后续规划
 
-- [ ] 增量索引模式
 - [ ] 字面量预筛（`aho-corasick`）提升性能
 - [ ] 配置文件 `.fsearch.toml`
 - [ ] `lib.rs` 拆分，供其他程序依赖
+- [ ] 索引自动更新（基于文件 mtime 判断变化）
 
 ## 贡献
 
