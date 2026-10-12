@@ -5,6 +5,7 @@ use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
 use crate::search::{FileResult, OutputLine};
 
+/// 根据 color 参数与 stdout 是否终端决定是否启用颜色
 pub fn choose_color(choice: &str) -> ColorChoice {
     match choice {
         "always" => ColorChoice::Always,
@@ -19,10 +20,12 @@ pub fn choose_color(choice: &str) -> ColorChoice {
     }
 }
 
-/// 输出接口，普通文本或 JSON
+/// 输出接口：普通文本 / JSON / 静默
 pub enum Output {
     Plain(Printer),
     Json(JsonPrinter),
+    /// --quiet：什么都不输出
+    Null,
 }
 
 impl Output {
@@ -31,22 +34,27 @@ impl Output {
         result: &FileResult,
         files_with_matches: bool,
         count: bool,
+        count_matches: bool,
     ) -> Result<()> {
         match self {
-            Output::Plain(p) => p.print_file_result(result, files_with_matches, count),
-            Output::Json(p) => p.print_file_result(result, files_with_matches, count),
+            Output::Plain(p) => {
+                p.print_file_result(result, files_with_matches, count, count_matches)
+            }
+            Output::Json(p) => {
+                p.print_file_result(result, files_with_matches, count, count_matches)
+            }
+            Output::Null => Ok(()),
         }
     }
 
-    /// 只输出一个文件路径（--name / --files 模式）
     pub fn print_filename_only(&mut self, path: &str) -> Result<()> {
         match self {
             Output::Plain(p) => p.print_filename_pub(path),
             Output::Json(p) => p.print_file_event(path),
+            Output::Null => Ok(()),
         }
     }
 
-    /// 打印汇总事件（--json --stats）
     pub fn print_summary(
         &mut self,
         files_scanned: usize,
@@ -55,10 +63,11 @@ impl Output {
         elapsed_nanos: u128,
     ) -> Result<()> {
         match self {
-            Output::Plain(_) => Ok(()), // 普通模式走 stderr
+            Output::Plain(_) => Ok(()),
             Output::Json(p) => {
                 p.print_summary(files_scanned, files_matched, matches, elapsed_nanos)
             }
+            Output::Null => Ok(()),
         }
     }
 }
@@ -84,12 +93,18 @@ impl Printer {
         result: &FileResult,
         files_with_matches: bool,
         count: bool,
+        count_matches: bool,
     ) -> Result<()> {
         if files_with_matches {
             return self.print_filename_pub(&result.path);
         }
         if count {
-            return self.print_count(&result.path, result.match_count);
+            let n = if count_matches {
+                result.occurrence_count
+            } else {
+                result.match_count
+            };
+            return self.print_count(&result.path, n);
         }
 
         for line in &result.output {
@@ -272,6 +287,7 @@ impl JsonPrinter {
         result: &FileResult,
         files_with_matches: bool,
         count: bool,
+        count_matches: bool,
     ) -> Result<()> {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
@@ -289,11 +305,16 @@ impl JsonPrinter {
                 json_str(&result.path)
             )?;
         } else if count {
+            let n = if count_matches {
+                result.occurrence_count
+            } else {
+                result.match_count
+            };
             writeln!(
                 out,
                 r#"{{"type":"count","path":{},"count":{}}}"#,
                 json_str(&result.path),
-                result.match_count
+                n
             )?;
         } else {
             for line in &result.output {

@@ -28,13 +28,20 @@
 - 全词匹配 `-w`、反向匹配 `-v`、固定字符串 `-F`
 - 只输出匹配部分 `-o`
 - 替换输出 `-r`
+- 多模式 `-e`
 - 按文件类型过滤 `--type`、排除类型 `--type-not`
 - 按文件名搜索 `--name`、只列文件 `--files`
+- 列出不匹配文件 `--files-without-match`
+- 统计匹配次数 `--count-matches`
 - 每文件上限 `-m N`、统计 `--stats`
 - 排序输出 `--sort`
 - 编码支持 `--encoding`（GBK、Big5、Shift_JIS 等）
 - `-u` / `-uu` / `-uuu` 逐级放宽忽略规则
+- 递归深度 `--max-depth`、文件大小 `--max-filesize`
+- 静默模式 `-q`
 - JSON Lines 输出 `--json`（含 begin/end/summary 事件）
+- Shell 补全生成 `--generate-completions`
+- Man 手册生成 `--generate-man`
 - 并行遍历（`ignore` 的并行 Walker）
 - 流式逐行搜索，内存与文件大小无关
 - 支持非 UTF-8，跳过二进制文件
@@ -62,10 +69,38 @@ cargo build --release
 cargo install --git https://github.com/msxyy/fsearch
 ```
 
+## Shell 补全与 man 手册
+
+`fsearch` 可以生成自己的补全脚本和手册页。
+
+```bash
+# bash
+fsearch --generate-completions bash > fsearch.bash
+sudo cp fsearch.bash /usr/share/bash-completion/completions/fsearch
+
+# zsh
+fsearch --generate-completions zsh > _fsearch
+sudo cp _fsearch /usr/local/share/zsh/site-functions/_fsearch
+
+# fish
+fsearch --generate-completions fish > fsearch.fish
+cp fsearch.fish ~/.config/fish/completions/fsearch.fish
+
+# PowerShell：把下面这行加到 $PROFILE
+fsearch --generate-completions powershell > fsearch.ps1
+# . D:\path\to\fsearch.ps1
+
+# man 手册
+fsearch --generate-man > fsearch.1
+sudo cp fsearch.1 /usr/share/man/man1/
+```
+
 ## 用法
 
 ```
 fsearch [OPTIONS] <PATTERN> [PATH]
+fsearch [OPTIONS] -e <PATTERN> -e <PATTERN> ... [PATH]
+fsearch [OPTIONS] --files [PATH]
 ```
 
 `PATTERN` 是搜索模式，默认按正则解释。`PATH` 是搜索路径，默认当前目录。
@@ -109,6 +144,9 @@ fsearch -o "fn \w+" ./src
 # 替换匹配部分（不写回文件）
 fsearch -r "BAR" "foo" ./src
 
+# 多个模式，任一匹配即命中
+fsearch -e "fn main" -e "fn run" -n ./src
+
 # 只搜 Rust 文件
 fsearch --type rust "Result" .
 
@@ -123,6 +161,12 @@ fsearch --name "main" .
 
 # 只列出会被搜索的文件
 fsearch --files .
+
+# 列出不含匹配的文件
+fsearch --files-without-match "fn main" ./src
+
+# 统计匹配次数（每次出现都算一次）
+fsearch --count-matches "fn " ./src
 
 # 每个文件最多输出 1 条匹配
 fsearch -m 1 "fn " ./src
@@ -141,6 +185,16 @@ fsearch -uu "target" .
 
 # 不读 .gitignore，搜隐藏文件，也搜二进制
 fsearch -uuu "fsearch" .
+
+# 限制递归深度
+fsearch --max-depth 1 -l "fn " .
+
+# 跳过大于 1MB 的文件
+fsearch --max-filesize 1M -l "fn " .
+
+# 静默模式，只返回退出码
+fsearch -q "fn main" ./src
+echo $LASTEXITCODE
 
 # 搜 GBK 编码的文件
 fsearch --encoding gbk "中文" .
@@ -168,21 +222,29 @@ fsearch -i -n -C 1 --type rust "result" .
 | `-F` / `--fixed` | 把模式当作固定字符串，不解释为正则 |
 | `-o` / `--only-matching` | 只输出匹配部分，而不是整行 |
 | `-r TEXT` / `--replace TEXT` | 把匹配部分替换成 TEXT，输出替换后的行（不写回文件） |
+| `-e PATTERN` / `--regexp PATTERN` | 添加搜索模式，可重复；与位置参数 PATTERN 可同时使用 |
 | `-m N` / `--max-count N` | 每个文件最多输出 N 条匹配 |
 | `-g GLOB` / `--glob` | 只搜索匹配 glob 的文件 |
 | `--type TYPE` | 按文件类型过滤，可重复 |
 | `--type-not TYPE` | 排除指定文件类型，可重复 |
 | `--name` | 按文件名搜索，不搜索文件内容 |
 | `--files` | 只列出会被搜索的文件，不搜索内容 |
+| `--files-without-match` | 列出不含匹配的文件（`-l` 的反向） |
+| `--count-matches` | 统计匹配次数（每次出现都算一次）；隐含 `-c` |
 | `--sort` | 并行搜索但输出按路径排序 |
 | `--json` | 以 JSON Lines 格式输出 |
 | `--stats` | 输出统计信息（扫描文件数、匹配数、耗时） |
 | `--encoding ENC` | 指定文件编码，如 gbk、big5、shift_jis |
 | `--no-ignore` | 不读取 `.gitignore` / `.ignore` |
 | `-u` / `-uu` / `-uuu` | 逐级放宽忽略规则 |
+| `--max-depth N` | 限制递归深度 |
+| `--max-filesize SIZE` | 跳过大于 SIZE 的文件，支持 `10M`、`1G`、`500K` |
+| `-q` / `--quiet` | 静默模式，只返回退出码 |
 | `--color MODE` | 颜色模式：`auto` / `always` / `never` |
 | `--follow` | 跟随符号链接 |
 | `--hidden` | 搜索隐藏文件 |
+| `--generate-completions SHELL` | 生成 shell 补全脚本到 stdout |
+| `--generate-man` | 生成 man 手册页到 stdout |
 | `-h` / `--help` | 显示帮助 |
 | `-V` / `--version` | 显示版本 |
 
@@ -262,7 +324,7 @@ fsearch -i -n -C 1 --type rust "result" .
 
 `submatches` 是匹配在一行中的字节区间数组。
 
-`-c` 模式下的统计事件：
+`-c` / `--count-matches` 模式下的统计事件：
 
 ```json
 {"type":"count","path":"./src/main.rs","count":2}
@@ -293,7 +355,7 @@ src/
 ├── main.rs     # 入口、参数组装、并行遍历
 ├── cli.rs      # clap 参数定义
 ├── search.rs   # 单文件流式搜索
-└── printer.rs  # 输出（普通 / JSON）
+└── printer.rs  # 输出（普通 / JSON / 静默）
 
 tests/
 └── cli.rs      # 集成测试
@@ -308,10 +370,10 @@ benches/
 cargo test
 ```
 
-包含 **71 个测试**：
+包含 **89 个测试**：
 
-- 44 个单元测试：搜索逻辑、参数组装、JSON 转义
-- 27 个集成测试：调用真实 exe，验证端到端行为
+- 52 个单元测试：搜索逻辑、参数组装、JSON 转义、多模式合并、大小解析
+- 37 个集成测试：调用真实 exe，验证端到端行为
 
 ## 代码质量
 
@@ -360,14 +422,14 @@ cargo bench
 - **`--replace` 与高亮**：替换后清空匹配区间，避免字节偏移越界
 - **`.gitignore` 生效范围**：即使不在 git 仓库里，也会读取 `.gitignore`（通过 `require_git(false)`）
 - **`--sort` 模式**：并行搜索，收集结果后按路径排序，再串行打印
+- **`-e` 与位置参数**：有 `-e` 时，位置参数被当作路径；无 `-e` 时，位置参数当作模式
 
 ## 后续规划
 
-- [ ] `-e PATTERN` 支持多个模式
-- [ ] `--files-without-match` 反向文件列表
-- [ ] `--count-matches` 统计匹配次数（而非匹配行数）
-- [ ] Shell 自动补全
 - [ ] 增量索引模式
+- [ ] 字面量预筛（`aho-corasick`）提升性能
+- [ ] 配置文件 `.fsearch.toml`
+- [ ] `lib.rs` 拆分，供其他程序依赖
 
 ## 贡献
 

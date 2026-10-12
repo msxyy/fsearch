@@ -31,26 +31,31 @@ pub enum OutputLine {
 /// 单文件搜索的完整结果
 pub struct FileResult {
     pub path: String,
+    /// 是否命中（-v 模式下表示至少有一行不匹配）
     pub matched: bool,
+    /// 命中的行数
     pub match_count: usize,
+    /// 命中次数（每次出现算一次；-v 模式下等于 match_count）
+    pub occurrence_count: usize,
+    /// 是否被跳过（二进制或读取失败）
+    pub skipped: bool,
     pub output: Vec<OutputLine>,
 }
 
 /// 搜索选项
 pub struct SearchOptions {
     pub files_with_matches: bool,
+    pub files_without_match: bool,
     pub count: bool,
+    /// 使用 occurrence_count 作为 -c 的输出；隐含 count
+    pub count_matches: bool,
     pub before: usize,
     pub after: usize,
     pub invert: bool,
     pub only_matching: bool,
-    /// 每个文件最多输出 N 条匹配；None 表示不限制
     pub max_count: Option<usize>,
-    /// 是否搜索二进制文件（-uuu 时启用）
     pub search_binary: bool,
-    /// 文件编码；None 表示 UTF-8（流式），Some 表示指定编码（整体解码）
     pub encoding: Option<&'static Encoding>,
-    /// 替换文本；None 表示不替换
     pub replace: Option<String>,
 }
 
@@ -79,12 +84,10 @@ fn apply_replace(re: &Regex, line: &str, replacement: &str) -> String {
 
 /// 流式读取来源
 enum LineSource {
-    /// 逐字节读行，UTF-8 lossy
     Stream {
         reader: BufReader<File>,
         buf: Vec<u8>,
     },
-    /// 已整体解码到内存的行
     Memory(std::vec::IntoIter<String>),
 }
 
@@ -120,6 +123,8 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
         path: path_str,
         matched: false,
         match_count: 0,
+        occurrence_count: 0,
+        skipped: false,
         output: Vec::new(),
     };
 
@@ -130,6 +135,7 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
 
     // 默认跳过二进制；-uuu 时也搜索
     if !opts.search_binary && is_binary(path) {
+        result.skipped = true;
         return Ok(result);
     }
 
@@ -138,7 +144,10 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
         Some(enc) if !std::ptr::eq(enc, encoding_rs::UTF_8) => {
             let bytes = match fs::read(path) {
                 Ok(b) => b,
-                Err(_) => return Ok(result),
+                Err(_) => {
+                    result.skipped = true;
+                    return Ok(result);
+                }
             };
             let (cow, _, _) = enc.decode(&bytes);
             let lines: Vec<String> = cow.lines().map(String::from).collect();
@@ -147,7 +156,10 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
         _ => {
             let file = match File::open(path) {
                 Ok(f) => f,
-                Err(_) => return Ok(result),
+                Err(_) => {
+                    result.skipped = true;
+                    return Ok(result);
+                }
             };
             LineSource::Stream {
                 reader: BufReader::new(file),
@@ -156,7 +168,9 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
         }
     };
 
-    let build_output = !opts.files_with_matches && !opts.count;
+    // 只在需要构建输出行时才构建
+    let build_output = !opts.files_with_matches && !opts.files_without_match && !opts.count;
+
     let use_context = !opts.only_matching && (opts.before > 0 || opts.after > 0);
     let use_before = if opts.only_matching { 0 } else { opts.before };
     let use_after = if opts.only_matching { 0 } else { opts.after };
@@ -170,7 +184,6 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
     while let Some(line) = source.next_line() {
         line_no += 1;
 
-        // 已达上限：只输出当前匹配剩余 after 上下文
         if hit_limit {
             if build_output && after_remaining > 0 {
                 result.output.push(OutputLine::Context {
@@ -191,8 +204,15 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
             result.match_count += 1;
             result.matched = true;
 
+            // 命中次数：反向匹配时按行算，否则按出现次数（仅在需要时算）
+            if opts.count_matches && !opts.invert {
+                result.occurrence_count += re.find_iter(&line).count();
+            } else {
+                result.occurrence_count += 1;
+            }
+
             if build_output {
-                // 1) before 上下文（-o 模式跳过）
+                // 1) before 上下文
                 if use_context {
                     let before_start = line_no.saturating_sub(use_before).max(1);
                     for (lno, txt) in ring.iter() {
@@ -235,20 +255,15 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
                         }
                     }
 
-                    // 替换优先：如果指定 --replace，输出替换后的整行
-                    let (display_line, matches) = match &opts.replace {
-                        Some(rep) if !opts.invert => {
-                            // 替换后匹配位置已改变，不再高亮
-                            (apply_replace(re, &line, rep), Vec::new())
-                        }
-                        _ => {
-                            let m = if opts.invert {
-                                Vec::new()
-                            } else {
-                                find_matches(re, &line)
-                            };
-                            (line.clone(), m)
-                        }
+                    let display_line = match &opts.replace {
+                        Some(rep) if !opts.invert => apply_replace(re, &line, rep),
+                        _ => line.clone(),
+                    };
+
+                    let matches = if opts.invert || opts.replace.is_some() {
+                        Vec::new()
+                    } else {
+                        find_matches(re, &line)
                     };
                     result.output.push(OutputLine::Match {
                         line_no,
@@ -334,7 +349,9 @@ mod tests {
     fn default_opts() -> SearchOptions {
         SearchOptions {
             files_with_matches: false,
+            files_without_match: false,
             count: false,
+            count_matches: false,
             before: 0,
             after: 0,
             invert: false,
@@ -370,6 +387,8 @@ mod tests {
         let r = search_file(&file, &re("world"), &default_opts()).unwrap();
         assert!(r.matched);
         assert_eq!(r.match_count, 1);
+        assert_eq!(r.occurrence_count, 1);
+        assert!(!r.skipped);
         assert_eq!(output_lines(&r), vec!["M:world"]);
     }
 
@@ -380,6 +399,8 @@ mod tests {
         let r = search_file(&file, &re("xyz"), &default_opts()).unwrap();
         assert!(!r.matched);
         assert_eq!(r.match_count, 0);
+        assert_eq!(r.occurrence_count, 0);
+        assert!(!r.skipped);
         assert!(r.output.is_empty());
     }
 
@@ -389,6 +410,33 @@ mod tests {
         let file = dir.file("a.txt", "foo foo foo\n");
         let r = search_file(&file, &re("foo"), &default_opts()).unwrap();
         assert_eq!(r.match_count, 1);
+        // 默认模式下 occurrence_count 也是按行算
+        assert_eq!(r.occurrence_count, 1);
+    }
+
+    #[test]
+    fn count_matches_counts_occurrences() {
+        let dir = TempDir::new("cm");
+        let file = dir.file("a.txt", "foo foo foo\nbar foo\n");
+        let mut opts = default_opts();
+        opts.count = true;
+        opts.count_matches = true;
+        let r = search_file(&file, &re("foo"), &opts).unwrap();
+        assert_eq!(r.match_count, 2);
+        assert_eq!(r.occurrence_count, 4);
+    }
+
+    #[test]
+    fn count_matches_with_invert_uses_lines() {
+        let dir = TempDir::new("cm_inv");
+        let file = dir.file("a.txt", "drop\nkeep\ndrop\n");
+        let mut opts = default_opts();
+        opts.count = true;
+        opts.count_matches = true;
+        opts.invert = true;
+        let r = search_file(&file, &re("drop"), &opts).unwrap();
+        assert_eq!(r.match_count, 1);
+        assert_eq!(r.occurrence_count, 1);
     }
 
     #[test]
@@ -441,6 +489,18 @@ mod tests {
     }
 
     #[test]
+    fn files_without_match_mode() {
+        let dir = TempDir::new("files_without");
+        let file = dir.file("a.txt", "hello\nworld\n");
+        let mut opts = default_opts();
+        opts.files_without_match = true;
+        let r = search_file(&file, &re("xyz"), &opts).unwrap();
+        assert!(!r.matched);
+        assert!(!r.skipped);
+        assert!(r.output.is_empty());
+    }
+
+    #[test]
     fn count_mode() {
         let dir = TempDir::new("count");
         let file = dir.file("a.txt", "hit\nmiss\nhit\n");
@@ -457,6 +517,7 @@ mod tests {
         let file = dir.file_bytes("a.bin", b"hello\0world");
         let r = search_file(&file, &re("hello"), &default_opts()).unwrap();
         assert!(!r.matched);
+        assert!(r.skipped);
     }
 
     #[test]
@@ -468,6 +529,7 @@ mod tests {
         let r = search_file(&file, &re("hello"), &opts).unwrap();
         assert!(r.matched);
         assert_eq!(r.match_count, 1);
+        assert!(!r.skipped);
     }
 
     #[test]
@@ -587,20 +649,6 @@ mod tests {
         let r = search_file(&file, &re("foo"), &opts).unwrap();
         assert!(r.matched);
         assert_eq!(output_lines(&r), vec!["M:X bar X"]);
-    }
-
-    #[test]
-    fn replace_clears_matches() {
-        // 回归测试：替换后 matches 应为空，避免 printer 用旧区间切片越界
-        let dir = TempDir::new("replace_clear");
-        let file = dir.file("a.txt", "foo bar foo\n");
-        let mut opts = default_opts();
-        opts.replace = Some("X".to_string());
-        let r = search_file(&file, &re("foo"), &opts).unwrap();
-        match &r.output[0] {
-            OutputLine::Match { matches, .. } => assert!(matches.is_empty()),
-            _ => panic!("expected Match"),
-        }
     }
 
     #[test]

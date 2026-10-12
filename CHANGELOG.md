@@ -7,6 +7,23 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-12
+
+### Added
+
+- `-e PATTERN` / `--regexp PATTERN` 支持多个搜索模式，任一匹配即命中
+- `--files-without-match` 列出不含匹配的文件（`-l` 的反向）
+- `--count-matches` 统计匹配次数（每次出现都算一次），而非匹配行数
+- `--max-depth N` 限制递归深度
+- `--max-filesize SIZE` 跳过大于指定大小的文件（支持 `10M`、`1G`、`500K`）
+- `-q` / `--quiet` 静默模式，只返回退出码
+- `--generate-completions <SHELL>` 生成 shell 补全脚本（bash / zsh / fish / powershell / elvish）
+- `--generate-man` 生成 man 手册页
+
+### Fixed
+
+- 多个 `-e` 时，位置参数被误当作搜索模式而非路径
+
 ## [0.2.0] - 2026-10-12
 
 ### Added
@@ -46,6 +63,7 @@
 - 退出码：0 找到 / 1 未找到 / 2 出错
 - 47 个测试：31 单元 + 16 集成
 
-[Unreleased]: https://github.com/msxyy/fsearch/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/msxyy/fsearch/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/msxyy/fsearch/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/msxyy/fsearch/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/msxyy/fsearch/releases/tag/v0.1.0

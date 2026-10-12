@@ -1,6 +1,6 @@
 [package]
 name = "fsearch"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["msxyy"]
 description = "用 Rust 写的文件内容搜索器，ripgrep 简化版"
@@ -23,6 +23,8 @@ harness = false
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
 encoding_rs = "0.8"
 ignore = "0.4"
 regex = "1"

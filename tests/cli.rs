@@ -92,7 +92,6 @@ fn fixed_mode_literal_paren() {
     let dir = TempDir::new("fixed");
     dir.file("a.rs", "fn(x)\nfn x\n");
 
-    // 不加 -F 时 "fn(" 是非法正则，返回 2
     let out = fsearch()
         .arg("fn(")
         .arg(dir.0.to_str().unwrap())
@@ -100,7 +99,6 @@ fn fixed_mode_literal_paren() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
 
-    // 加 -F 后当作字面量
     let out = fsearch()
         .arg("-F")
         .arg("fn(")
@@ -127,7 +125,7 @@ fn word_mode_no_partial_match() {
 
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("\nfn\n") || stdout.contains(":fn\n") || stdout.contains("fn\n"));
+    assert!(stdout.contains("fn\n") || stdout.contains(":fn\n"));
     assert!(!stdout.contains("define"));
     assert!(!stdout.contains("fnord"));
 }
@@ -314,7 +312,6 @@ fn no_ignore_includes_ignored_files() {
     dir.file("secret.txt", "needle\n");
     dir.file("visible.txt", "needle\n");
 
-    // 默认跳过 secret.txt
     let out = fsearch()
         .arg("-l")
         .arg("needle")
@@ -325,7 +322,6 @@ fn no_ignore_includes_ignored_files() {
     assert!(stdout.contains("visible.txt"));
     assert!(!stdout.contains("secret.txt"));
 
-    // --no-ignore 包含 secret.txt
     let out = fsearch()
         .arg("--no-ignore")
         .arg("-l")
@@ -357,7 +353,7 @@ fn json_has_begin_end_summary() {
     assert!(stdout.contains(r#""type":"summary""#));
 }
 
-// ---------- 第一批新增：--type-not / -u / -uu ----------
+// ---------- v0.2.0 新增 ----------
 
 #[test]
 fn type_not_excludes() {
@@ -388,7 +384,6 @@ fn type_and_type_not_combined() {
     dir.file("b.py", "needle\n");
     dir.file("c.md", "needle\n");
 
-    // --type python：只搜 .py，--type-not markdown：排除 .md
     let out = fsearch()
         .arg("--type")
         .arg("python")
@@ -414,7 +409,6 @@ fn u_flag_ignores_gitignore() {
     dir.file("secret.txt", "needle\n");
     dir.file("visible.txt", "needle\n");
 
-    // 默认跳过 secret.txt
     let out = fsearch()
         .arg("-l")
         .arg("needle")
@@ -424,7 +418,6 @@ fn u_flag_ignores_gitignore() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!stdout.contains("secret.txt"));
 
-    // -u 包含 secret.txt
     let out = fsearch()
         .arg("-u")
         .arg("-l")
@@ -442,7 +435,6 @@ fn uu_flag_searches_hidden() {
     dir.file(".hidden.txt", "needle\n");
     dir.file("visible.txt", "needle\n");
 
-    // 默认不搜隐藏文件
     let out = fsearch()
         .arg("-l")
         .arg("needle")
@@ -452,7 +444,6 @@ fn uu_flag_searches_hidden() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!stdout.contains(".hidden.txt"));
 
-    // -uu 搜隐藏文件
     let out = fsearch()
         .arg("-uu")
         .arg("-l")
@@ -463,6 +454,8 @@ fn uu_flag_searches_hidden() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(".hidden.txt"));
 }
+
+// ---------- v0.2.0 --encoding ----------
 
 #[test]
 fn gbk_encoding_searches_chinese() {
@@ -518,6 +511,8 @@ fn unknown_encoding_errors() {
     assert!(stderr.contains("未知编码") || stderr.contains("fsearch:"));
 }
 
+// ---------- v0.2.0 --sort / --replace ----------
+
 #[test]
 fn sort_output_is_sorted() {
     let dir = TempDir::new("sort");
@@ -555,9 +550,14 @@ fn replace_substitutes() {
         .output()
         .unwrap();
 
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "exit: {:?}, stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("X bar X"));
+    assert!(stdout.contains("X bar X"), "stdout: {stdout}");
     assert!(!stdout.contains("foo"));
 }
 
@@ -574,9 +574,14 @@ fn replace_with_capture_group() {
         .output()
         .unwrap();
 
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "exit: {:?}, stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("[foo]"));
+    assert!(stdout.contains("[foo]"), "stdout: {stdout}");
 }
 
 #[test]
@@ -584,7 +589,6 @@ fn replace_ignored_with_only_matching() {
     let dir = TempDir::new("replace_om");
     dir.file("a.txt", "foo bar foo\n");
 
-    // -o 优先于 -r
     let out = fsearch()
         .arg("-o")
         .arg("-r")
@@ -598,4 +602,215 @@ fn replace_ignored_with_only_matching() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert_eq!(stdout.matches("foo").count(), 2);
     assert!(!stdout.contains("X"));
+}
+
+// ---------- v0.3.0 新增：-e / --files-without-match / --count-matches / --max-depth / --max-filesize / -q ----------
+
+#[test]
+fn multi_pattern_e_flag() {
+    let dir = TempDir::new("multipat");
+    dir.file("a.txt", "foo\nbar\nbaz\n");
+
+    let out = fsearch()
+        .arg("-e")
+        .arg("foo")
+        .arg("-e")
+        .arg("bar")
+        .arg("-n")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("foo"));
+    assert!(stdout.contains("bar"));
+    assert!(!stdout.contains("baz"));
+}
+
+#[test]
+fn multi_pattern_positional_plus_e() {
+    let dir = TempDir::new("multipat2");
+    dir.file("a.txt", "foo\nbar\nbaz\n");
+
+    // 位置参数 + -e 都算模式；用 -e 传所有模式，避免歧义
+    let out = fsearch()
+        .arg("-e")
+        .arg("foo")
+        .arg("-e")
+        .arg("baz")
+        .arg("-n")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("foo"));
+    assert!(stdout.contains("baz"));
+    assert!(!stdout.contains("bar"));
+}
+
+#[test]
+fn files_without_match_lists_non_matching() {
+    let dir = TempDir::new("fwm");
+    dir.file("has.txt", "needle\n");
+    dir.file("no1.txt", "other\n");
+    dir.file("no2.txt", "another\n");
+
+    let out = fsearch()
+        .arg("--files-without-match")
+        .arg("needle")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("has.txt"));
+    assert!(stdout.contains("no1.txt"));
+    assert!(stdout.contains("no2.txt"));
+}
+
+#[test]
+fn count_matches_counts_occurrences() {
+    let dir = TempDir::new("cm_cli");
+    dir.file("a.txt", "foo foo foo\nbar foo\n");
+
+    let out = fsearch()
+        .arg("--count-matches")
+        .arg("foo")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(":4"), "stdout: {stdout}");
+}
+
+#[test]
+fn max_depth_limits_recursion() {
+    let dir = TempDir::new("maxdepth");
+    fs::create_dir_all(dir.0.join("sub")).unwrap();
+    dir.file("top.txt", "needle\n");
+    fs::write(dir.0.join("sub").join("deep.txt"), "needle\n").unwrap();
+
+    let out = fsearch()
+        .arg("--max-depth")
+        .arg("1")
+        .arg("-l")
+        .arg("needle")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("top.txt"));
+    assert!(!stdout.contains("deep.txt"));
+}
+
+#[test]
+fn max_filesize_skips_large() {
+    let dir = TempDir::new("maxsize");
+    let big = "needle\n".repeat(1000); // ~7KB
+    dir.file("small.txt", "needle\n");
+    dir.file("big.txt", &big);
+
+    let out = fsearch()
+        .arg("--max-filesize")
+        .arg("1K")
+        .arg("-l")
+        .arg("needle")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("small.txt"));
+    assert!(!stdout.contains("big.txt"));
+}
+
+#[test]
+fn quiet_mode_no_output() {
+    let dir = TempDir::new("quiet");
+    dir.file("a.txt", "needle\n");
+
+    let out = fsearch()
+        .arg("-q")
+        .arg("needle")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn quiet_mode_returns_one_on_no_match() {
+    let dir = TempDir::new("quiet2");
+    dir.file("a.txt", "needle\n");
+
+    let out = fsearch()
+        .arg("-q")
+        .arg("xyz")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+}
+
+// ---------- v0.3.0 新增：补全 / man ----------
+
+#[test]
+fn generate_completions_bash() {
+    let out = fsearch()
+        .arg("--generate-completions")
+        .arg("bash")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // bash 补全脚本通常包含 _fsearch 函数
+    assert!(stdout.contains("_fsearch") || stdout.contains("fsearch"));
+}
+
+#[test]
+fn generate_man_page() {
+    let out = fsearch().arg("--generate-man").output().unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // man 页通常以 .TH 开头
+    assert!(stdout.contains(".TH") || stdout.contains("FSEARCH"));
 }

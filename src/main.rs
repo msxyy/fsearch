@@ -43,7 +43,44 @@ fn main() -> ExitCode {
     }
 }
 
-/// 根据 -F / -w 组装最终正则模式字符串
+/// 生成 shell 补全脚本到 stdout
+fn generate_completions(shell: &str) -> Result<()> {
+    use clap::CommandFactory;
+    use clap_complete::{generate, shells};
+    use std::io;
+
+    let mut cmd = Cli::command();
+    match shell.to_lowercase().as_str() {
+        "bash" => generate(shells::Bash, &mut cmd, "fsearch", &mut io::stdout()),
+        "zsh" => generate(shells::Zsh, &mut cmd, "fsearch", &mut io::stdout()),
+        "fish" => generate(shells::Fish, &mut cmd, "fsearch", &mut io::stdout()),
+        "powershell" | "pwsh" => {
+            generate(shells::PowerShell, &mut cmd, "fsearch", &mut io::stdout())
+        }
+        "elvish" => generate(shells::Elvish, &mut cmd, "fsearch", &mut io::stdout()),
+        other => anyhow::bail!(
+            "不支持的 shell: {}（支持 bash, zsh, fish, powershell, elvish）",
+            other
+        ),
+    }
+    Ok(())
+}
+
+/// 生成 man 手册页到 stdout
+fn generate_man() -> Result<()> {
+    use clap::CommandFactory;
+    use clap_mangen::Man;
+    use std::io::Write;
+
+    let cmd = Cli::command();
+    let man = Man::new(cmd);
+    let mut buf = Vec::new();
+    man.render(&mut buf)?;
+    std::io::stdout().write_all(&buf)?;
+    Ok(())
+}
+
+/// 根据 -F / -w 组装单个模式的最终正则字符串
 pub fn build_pattern(pattern: &str, fixed: bool, word: bool) -> String {
     let mut p = if fixed {
         regex::escape(pattern)
@@ -54,6 +91,29 @@ pub fn build_pattern(pattern: &str, fixed: bool, word: bool) -> String {
         p = format!(r"\b(?:{})\b", p);
     }
     p
+}
+
+/// 把多个模式合并成一个正则字符串
+///
+/// - 单模式：等价于 `build_pattern`
+/// - 多模式：用 `|` 连接，非 `-w` 时用 `(?:...)` 包裹
+pub fn build_combined_pattern(patterns: &[String], fixed: bool, word: bool) -> String {
+    if patterns.is_empty() {
+        return String::new();
+    }
+    if patterns.len() == 1 {
+        return build_pattern(&patterns[0], fixed, word);
+    }
+    let escaped: Vec<String> = patterns
+        .iter()
+        .map(|p| if fixed { regex::escape(p) } else { p.clone() })
+        .collect();
+    let joined = escaped.join("|");
+    if word {
+        format!(r"\b(?:{})\b", joined)
+    } else {
+        format!(r"(?:{})", joined)
+    }
 }
 
 /// 把 --type / --type-not 映射到扩展名列表
@@ -90,16 +150,12 @@ fn extensions_for_type(t: &str) -> Option<&'static [&'static str]> {
 }
 
 /// 解析 --encoding 参数
-///
-/// 返回 None 表示使用默认 UTF-8 流式解码；
-/// 返回 Some(enc) 表示使用指定编码，整个文件会被解码到内存。
 fn parse_encoding(name: Option<&str>) -> Result<Option<&'static encoding_rs::Encoding>> {
     let name = match name {
         None => return Ok(None),
         Some(n) => n,
     };
     match encoding_rs::Encoding::for_label(name.as_bytes()) {
-        // 显式指定 UTF-8 时也走流式，避免整体读入
         Some(enc) if std::ptr::eq(enc, encoding_rs::UTF_8) => Ok(None),
         Some(enc) => Ok(Some(enc)),
         None => anyhow::bail!(
@@ -109,8 +165,39 @@ fn parse_encoding(name: Option<&str>) -> Result<Option<&'static encoding_rs::Enc
     }
 }
 
+/// 解析 --max-filesize，如 10M、1G、500K、1024
+fn parse_size(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let (num_str, mult) = if let Some(n) = s.strip_suffix(['K', 'k']) {
+        (n, 1024u64)
+    } else if let Some(n) = s.strip_suffix(['M', 'm']) {
+        (n, 1024u64 * 1024)
+    } else if let Some(n) = s.strip_suffix(['G', 'g']) {
+        (n, 1024u64 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix(['B', 'b']) {
+        (n, 1u64)
+    } else {
+        (s, 1u64)
+    };
+    let n: f64 = num_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("无效的文件大小: {}（例如 10M、1G、500K）", s))?;
+    Ok((n * mult as f64) as u64)
+}
+
 fn run() -> Result<bool> {
     let cli = Cli::parse();
+
+    // 处理 --generate-completions / --generate-man（隐藏 flag）
+    if let Some(shell) = cli.generate_completions.clone() {
+        generate_completions(&shell)?;
+        return Ok(true);
+    }
+    if cli.generate_man {
+        generate_man()?;
+        return Ok(true);
+    }
+
     let start = std::time::Instant::now();
 
     // 选择模式
@@ -122,26 +209,47 @@ fn run() -> Result<bool> {
         Mode::Content
     };
 
-    // 处理位置参数歧义：--files 模式下唯一位置参数当作 path
-    let (pattern_opt, path) = if mode == Mode::Files {
+    // 处理位置参数歧义：
+    // - --files 模式：唯一位置参数当作 path
+    // - 有 -e / --regexp：位置参数当作 path（第一个位置参数会被 clap 分配给
+    //   pattern，所以需要把 cli.pattern 当成 path）
+    // - 否则：第一个位置参数当模式，第二个当路径
+    let (patterns_opt, path): (Option<Vec<String>>, String) = if mode == Mode::Files {
         let p = if cli.path == "." {
             cli.pattern.clone().unwrap_or_else(|| ".".to_string())
         } else {
             cli.path.clone()
         };
         (None, p)
+    } else if !cli.patterns.is_empty() {
+        // 有 -e：位置参数是路径
+        let search_path = if cli.path != "." {
+            // 两个位置参数都给了：用最后一个当路径
+            cli.path.clone()
+        } else {
+            // 只有一个位置参数，被 clap 分给了 pattern
+            cli.pattern.clone().unwrap_or_else(|| ".".to_string())
+        };
+        (Some(cli.patterns.clone()), search_path)
     } else {
-        (cli.pattern.clone(), cli.path.clone())
+        let mut pats = Vec::new();
+        if let Some(p) = &cli.pattern {
+            pats.push(p.clone());
+        }
+        (Some(pats), cli.path.clone())
     };
 
     // 校验并构建正则
     let re: Option<Arc<Regex>> = match mode {
         Mode::Files => None,
         _ => {
-            let pat = pattern_opt
-                .clone()
+            let pats = patterns_opt
+                .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("缺少搜索模式"))?;
-            let built = build_pattern(&pat, cli.fixed, cli.word);
+            if pats.is_empty() {
+                anyhow::bail!("缺少搜索模式（请用位置参数或 -e 提供）");
+            }
+            let built = build_combined_pattern(pats, cli.fixed, cli.word);
             Some(Arc::new(
                 RegexBuilder::new(&built)
                     .case_insensitive(cli.ignore_case)
@@ -159,25 +267,41 @@ fn run() -> Result<bool> {
     let want_hidden = cli.hidden || cli.unrestricted >= 2;
     let search_binary = cli.unrestricted >= 3;
 
-    // 解析编码
     let encoding = parse_encoding(cli.encoding.as_deref())?;
+    let max_filesize = match cli.max_filesize.as_deref() {
+        Some(s) => Some(parse_size(s)?),
+        None => None,
+    };
 
     let sort_output = cli.sort;
-    // 替换只对普通匹配输出生效；与 -l/-c/-o/--json 互斥时以后者优先
-    let replace: Option<Arc<String>> =
-        if cli.json || cli.files_with_matches || cli.count || cli.only_matching {
-            None
-        } else {
-            cli.replace.clone().map(Arc::new)
-        };
+    let quiet = cli.quiet;
+
+    // count_matches 隐含 count
+    let count = cli.count || cli.count_matches;
+    let count_matches = cli.count_matches;
+    let files_without_match = cli.files_without_match;
+
+    // 替换只对普通匹配输出生效
+    let replace: Option<Arc<String>> = if cli.json
+        || cli.files_with_matches
+        || files_without_match
+        || count
+        || cli.only_matching
+    {
+        None
+    } else {
+        cli.replace.clone().map(Arc::new)
+    };
 
     // 遍历器
     let mut builder = WalkBuilder::new(&path);
     builder
         .hidden(!want_hidden)
         .follow_links(cli.follow)
-        // 即使不在 git 仓库里，也读取 .gitignore
         .require_git(false);
+    if let Some(d) = cli.max_depth {
+        builder.max_depth(Some(d));
+    }
     if no_ignore {
         builder
             .ignore(false)
@@ -186,7 +310,6 @@ fn run() -> Result<bool> {
             .git_exclude(false);
     }
 
-    // --glob 与 --type / --type-not 通过 OverrideBuilder
     let has_overrides =
         cli.glob.is_some() || !cli.type_filter.is_empty() || !cli.type_not_filter.is_empty();
     if has_overrides {
@@ -221,7 +344,9 @@ fn run() -> Result<bool> {
     } else {
         choose_color(&cli.color)
     };
-    let mut output = if cli.json {
+    let mut output = if quiet {
+        Output::Null
+    } else if cli.json {
         Output::Json(JsonPrinter::new())
     } else {
         Output::Plain(Printer::new(color_choice, cli.line_number))
@@ -234,7 +359,6 @@ fn run() -> Result<bool> {
     let total_matches = Arc::new(AtomicUsize::new(0));
 
     let files_with_matches = cli.files_with_matches;
-    let count = cli.count;
     let invert = cli.invert;
     let only_matching = cli.only_matching;
     let max_count = cli.max_count;
@@ -242,7 +366,7 @@ fn run() -> Result<bool> {
     let files_mode = mode == Mode::Files;
 
     if sort_output {
-        // 并行搜索，结果收集后按路径排序，再串行打印
+        // 并行搜索，收集结果后按路径排序，再串行打印
         let collected: CollectedResults = Arc::new(Mutex::new(Vec::new()));
 
         let walker = builder.build_parallel();
@@ -279,9 +403,18 @@ fn run() -> Result<bool> {
                         }
                     }
                 } else if let Some(re) = &re {
+                    if let Some(max) = max_filesize {
+                        if let Ok(meta) = std::fs::metadata(path) {
+                            if meta.len() > max {
+                                return WalkState::Continue;
+                            }
+                        }
+                    }
                     let opts = SearchOptions {
                         files_with_matches,
+                        files_without_match,
                         count,
+                        count_matches,
                         before,
                         after,
                         invert,
@@ -292,10 +425,17 @@ fn run() -> Result<bool> {
                         replace: replace.as_ref().map(|s| (**s).clone()),
                     };
                     if let Ok(r) = search::search_file(path, re, &opts) {
-                        if r.matched {
+                        let interesting = if files_without_match {
+                            !r.matched && !r.skipped
+                        } else {
+                            r.matched
+                        };
+                        if interesting {
                             any_found.store(true, Ordering::Relaxed);
                             files_matched.fetch_add(1, Ordering::Relaxed);
-                            total_matches.fetch_add(r.match_count, Ordering::Relaxed);
+                            if r.matched {
+                                total_matches.fetch_add(r.match_count, Ordering::Relaxed);
+                            }
                             collected.lock().unwrap().push((path_str, Some(r)));
                         }
                     }
@@ -315,7 +455,12 @@ fn run() -> Result<bool> {
                     let _ = output.print_filename_only(&path_str);
                 }
                 Some(r) => {
-                    let _ = output.print_file_result(&r, files_with_matches, count);
+                    if files_without_match {
+                        let _ = output.print_filename_only(&path_str);
+                    } else {
+                        let _ =
+                            output.print_file_result(&r, files_with_matches, count, count_matches);
+                    }
                 }
             }
         }
@@ -361,9 +506,18 @@ fn run() -> Result<bool> {
                         }
                     }
                 } else if let Some(re) = &re {
+                    if let Some(max) = max_filesize {
+                        if let Ok(meta) = std::fs::metadata(path) {
+                            if meta.len() > max {
+                                return WalkState::Continue;
+                            }
+                        }
+                    }
                     let opts = SearchOptions {
                         files_with_matches,
+                        files_without_match,
                         count,
+                        count_matches,
                         before,
                         after,
                         invert,
@@ -374,12 +528,28 @@ fn run() -> Result<bool> {
                         replace: replace.as_ref().map(|s| (**s).clone()),
                     };
                     if let Ok(r) = search::search_file(path, re, &opts) {
-                        if r.matched {
+                        let interesting = if files_without_match {
+                            !r.matched && !r.skipped
+                        } else {
+                            r.matched
+                        };
+                        if interesting {
                             any_found.store(true, Ordering::Relaxed);
                             files_matched.fetch_add(1, Ordering::Relaxed);
-                            total_matches.fetch_add(r.match_count, Ordering::Relaxed);
+                            if r.matched {
+                                total_matches.fetch_add(r.match_count, Ordering::Relaxed);
+                            }
                             if let Ok(mut out) = shared.lock() {
-                                let _ = out.print_file_result(&r, files_with_matches, count);
+                                if files_without_match {
+                                    let _ = out.print_filename_only(&path_str);
+                                } else {
+                                    let _ = out.print_file_result(
+                                        &r,
+                                        files_with_matches,
+                                        count,
+                                        count_matches,
+                                    );
+                                }
                             }
                         }
                     }
@@ -388,7 +558,6 @@ fn run() -> Result<bool> {
             })
         });
 
-        // 所有 worker 结束后取回 Output
         output = Arc::try_unwrap(shared)
             .map_err(|_| anyhow::anyhow!("内部错误：输出锁未释放"))?
             .into_inner()
@@ -538,5 +707,48 @@ mod tests {
     #[test]
     fn encoding_unknown_errors() {
         assert!(parse_encoding(Some("not-a-real-encoding")).is_err());
+    }
+
+    #[test]
+    fn size_bytes() {
+        assert_eq!(parse_size("1024").unwrap(), 1024);
+        assert_eq!(parse_size("1024B").unwrap(), 1024);
+    }
+
+    #[test]
+    fn size_kilo_mega_giga() {
+        assert_eq!(parse_size("10K").unwrap(), 10 * 1024);
+        assert_eq!(parse_size("10k").unwrap(), 10 * 1024);
+        assert_eq!(parse_size("10M").unwrap(), 10 * 1024 * 1024);
+        assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("1.5M").unwrap(), (1.5 * 1024.0 * 1024.0) as u64);
+    }
+
+    #[test]
+    fn size_invalid_errors() {
+        assert!(parse_size("abc").is_err());
+    }
+
+    #[test]
+    fn combined_single_pattern() {
+        let pats = vec!["fn".to_string()];
+        assert_eq!(build_combined_pattern(&pats, false, false), "fn");
+        assert_eq!(build_combined_pattern(&pats, false, true), r"\b(?:fn)\b");
+    }
+
+    #[test]
+    fn combined_multiple_patterns() {
+        let pats = vec!["foo".to_string(), "bar".to_string()];
+        assert_eq!(build_combined_pattern(&pats, false, false), r"(?:foo|bar)");
+        assert_eq!(
+            build_combined_pattern(&pats, false, true),
+            r"\b(?:foo|bar)\b"
+        );
+    }
+
+    #[test]
+    fn combined_fixed_escapes_each() {
+        let pats = vec!["a.b".to_string(), "c*d".to_string()];
+        assert_eq!(build_combined_pattern(&pats, true, false), r"(?:a\.b|c\*d)");
     }
 }

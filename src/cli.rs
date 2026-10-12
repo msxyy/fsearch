@@ -12,12 +12,16 @@ use clap::Parser;
 -uu   不读 .gitignore，且搜索隐藏文件\n\
 -uuu  不读 .gitignore，搜索隐藏文件和二进制文件")]
 pub struct Cli {
-    /// 搜索模式；--files 模式下可省略
+    /// 搜索模式；使用 -e 时可省略；--files 模式下位置参数是路径
     pub pattern: Option<String>,
 
-    /// 搜索路径，默认当前目录；--files 模式下唯一位置参数即路径
+    /// 搜索路径，默认当前目录
     #[arg(default_value = ".")]
     pub path: String,
+
+    /// 多个搜索模式，任一匹配即命中；与位置参数 PATTERN 二选一
+    #[arg(short = 'e', long = "regexp", value_name = "PATTERN")]
+    pub patterns: Vec<String>,
 
     /// 按文件名搜索，不搜索文件内容
     #[arg(long)]
@@ -55,6 +59,18 @@ pub struct Cli {
     #[arg(long, value_name = "ENCODING")]
     pub encoding: Option<String>,
 
+    /// 限制递归深度
+    #[arg(long = "max-depth", value_name = "N")]
+    pub max_depth: Option<usize>,
+
+    /// 跳过大于指定大小的文件，例如 10M、1G、500K
+    #[arg(long = "max-filesize", value_name = "SIZE")]
+    pub max_filesize: Option<String>,
+
+    /// 静默模式：不输出匹配结果，只返回退出码
+    #[arg(short = 'q', long)]
+    pub quiet: bool,
+
     /// 忽略大小写
     #[arg(short = 'i', long)]
     pub ignore_case: bool,
@@ -70,6 +86,14 @@ pub struct Cli {
     /// 只输出匹配的行数
     #[arg(short = 'c', long)]
     pub count: bool,
+
+    /// 统计匹配次数（每次出现都算一次），而非匹配行数；隐含 -c
+    #[arg(long = "count-matches", conflicts_with_all = ["files_with_matches", "files_without_match"])]
+    pub count_matches: bool,
+
+    /// 列出不含匹配的文件（-l 的反向）
+    #[arg(long = "files-without-match", conflicts_with_all = ["files_with_matches", "count", "count_matches"])]
+    pub files_without_match: bool,
 
     /// 显示匹配行前后的上下文行数
     #[arg(short = 'C', long, default_value_t = 0)]
@@ -126,4 +150,12 @@ pub struct Cli {
     /// 只搜索匹配 glob 的文件，例如 -g "*.rs"
     #[arg(short = 'g', long)]
     pub glob: Option<String>,
+
+    /// 生成 shell 补全脚本到 stdout（bash / zsh / fish / powershell / elvish）
+    #[arg(long, hide = true, value_name = "SHELL")]
+    pub generate_completions: Option<String>,
+
+    /// 生成 man 手册页到 stdout
+    #[arg(long, hide = true)]
+    pub generate_man: bool,
 }
