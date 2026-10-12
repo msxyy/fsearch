@@ -1,5 +1,6 @@
 mod cli;
 
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
@@ -11,6 +12,7 @@ use ignore::{overrides::OverrideBuilder, WalkBuilder, WalkState};
 use regex::{Regex, RegexBuilder};
 use std::process::ExitCode;
 
+use fsearch::config::Config;
 use fsearch::pattern::{build_combined_pattern, literal_patterns};
 use fsearch::search::FileResult;
 use fsearch::{choose_color, index, JsonPrinter, Output, Prefilter, Printer, SearchOptions};
@@ -156,7 +158,7 @@ fn run() -> Result<bool> {
     }
 
     if let Some(root) = cli.build_index.as_deref() {
-        let root_path = std::path::Path::new(root);
+        let root_path = Path::new(root);
         let n = index::build_and_save(root_path)?;
         let idx_path = index::index_path(root_path);
         eprintln!(
@@ -199,6 +201,64 @@ fn run() -> Result<bool> {
         (Some(pats), cli.path.clone())
     };
 
+    // 加载配置文件
+    let cfg = Config::load(Path::new(&path))?;
+
+    // 合并 CLI 与配置文件：CLI 优先
+    let ignore_case = cli.ignore_case.or(cfg.ignore_case).unwrap_or(false);
+    let line_number = cli.line_number.or(cfg.line_number).unwrap_or(false);
+    let word = cli.word.or(cfg.word).unwrap_or(false);
+    let fixed = cli.fixed.or(cfg.fixed).unwrap_or(false);
+    let invert = cli.invert.or(cfg.invert).unwrap_or(false);
+    let only_matching = cli.only_matching.or(cfg.only_matching).unwrap_or(false);
+    let quiet = cli.quiet.or(cfg.quiet).unwrap_or(false);
+    let sort_output = cli.sort.or(cfg.sort).unwrap_or(false);
+    let stats = cli.stats.or(cfg.stats).unwrap_or(false);
+    let json = cli.json.or(cfg.json).unwrap_or(false);
+    let files_with_matches = cli.files_with_matches.unwrap_or(false);
+    let files_without_match = cli.files_without_match.unwrap_or(false);
+    let count_matches = cli.count_matches.unwrap_or(false);
+    let count = cli.count.unwrap_or(false) || count_matches;
+    let use_index = cli.use_index.unwrap_or(false);
+
+    let no_ignore = cli.no_ignore.or(cfg.no_ignore).unwrap_or(false)
+        || cli.unrestricted >= 1
+        || cfg.unrestricted.unwrap_or(0) >= 1;
+    let want_hidden = cli.hidden.or(cfg.hidden).unwrap_or(false)
+        || cli.unrestricted >= 2
+        || cfg.unrestricted.unwrap_or(0) >= 2;
+    let search_binary = cli.unrestricted >= 3 || cfg.unrestricted.unwrap_or(0) >= 3;
+
+    let context = cli.context.or(cfg.context).unwrap_or(0);
+    let before = cli.before.or(cfg.before).unwrap_or(context);
+    let after = cli.after.or(cfg.after).unwrap_or(context);
+
+    let encoding = parse_encoding(cli.encoding.as_deref().or(cfg.encoding.as_deref()))?;
+    let max_filesize = match cli.max_filesize.as_deref().or(cfg.max_filesize.as_deref()) {
+        Some(s) => Some(parse_size(s)?),
+        None => None,
+    };
+    let max_depth = cli.max_depth.or(cfg.max_depth);
+    let max_count = cli.max_count.or(cfg.max_count);
+    let color = cli
+        .color
+        .clone()
+        .or(cfg.color.clone())
+        .unwrap_or_else(|| "auto".to_string());
+
+    let type_filter: Vec<String> = if !cli.type_filter.is_empty() {
+        cli.type_filter.clone()
+    } else {
+        cfg.type_filter.clone().unwrap_or_default()
+    };
+    let type_not_filter: Vec<String> = if !cli.type_not_filter.is_empty() {
+        cli.type_not_filter.clone()
+    } else {
+        cfg.type_not_filter.clone().unwrap_or_default()
+    };
+    let glob = cli.glob.clone().or(cfg.glob.clone());
+
+    // 构建正则
     let re: Option<Arc<Regex>> = match mode {
         Mode::Files => None,
         _ => {
@@ -208,68 +268,39 @@ fn run() -> Result<bool> {
             if pats.is_empty() {
                 anyhow::bail!("缺少搜索模式（请用位置参数或 -e 提供）");
             }
-            let built = build_combined_pattern(pats, cli.fixed, cli.word);
+            let built = build_combined_pattern(pats, fixed, word);
             Some(Arc::new(
                 RegexBuilder::new(&built)
-                    .case_insensitive(cli.ignore_case)
+                    .case_insensitive(ignore_case)
                     .build()?,
             ))
         }
     };
 
-    let before = cli.before.unwrap_or(cli.context);
-    let after = cli.after.unwrap_or(cli.context);
+    // 替换只对普通匹配输出生效
+    let replace: Option<Arc<String>> =
+        if json || files_with_matches || files_without_match || count || only_matching {
+            None
+        } else {
+            cli.replace.clone().or(cfg.replace.clone()).map(Arc::new)
+        };
 
-    let no_ignore = cli.no_ignore || cli.unrestricted >= 1;
-    let want_hidden = cli.hidden || cli.unrestricted >= 2;
-    let search_binary = cli.unrestricted >= 3;
-
-    let encoding = parse_encoding(cli.encoding.as_deref())?;
-    let max_filesize = match cli.max_filesize.as_deref() {
-        Some(s) => Some(parse_size(s)?),
-        None => None,
-    };
-
-    let sort_output = cli.sort;
-    let quiet = cli.quiet;
-
-    let count = cli.count || cli.count_matches;
-    let count_matches = cli.count_matches;
-    let files_without_match = cli.files_without_match;
-
-    let replace: Option<Arc<String>> = if cli.json
-        || cli.files_with_matches
-        || files_without_match
-        || count
-        || cli.only_matching
-    {
-        None
-    } else {
-        cli.replace.clone().map(Arc::new)
-    };
-
-    // 构建字面量预筛器
-    //
-    // 只有满足以下条件时才启用：
-    // - 有 pattern 列表
-    // - 没有 -v（反向匹配时预筛会漏掉应该命中的行）
-    // - pattern 全是字面量（含 -F，或本身不含正则元字符）
-    // - 没有 -w（\b 边界不能直接用字面量表达）
-    let prefilter: Option<Arc<Prefilter>> = if !cli.invert && mode == Mode::Content {
+    // 字面量预筛
+    let prefilter: Option<Arc<Prefilter>> = if !invert && mode == Mode::Content {
         patterns_opt.as_ref().and_then(|pats| {
-            literal_patterns(pats, cli.fixed, cli.word)
-                .and_then(|lits| Prefilter::new(&lits, cli.ignore_case))
+            literal_patterns(pats, fixed, word)
+                .and_then(|lits| Prefilter::new(&lits, ignore_case))
                 .map(Arc::new)
         })
     } else {
         None
     };
 
-    // --use-index：加载或自动重建索引
-    let candidate_paths: Option<Vec<String>> = if cli.use_index && mode == Mode::Content {
-        let root_path = std::path::Path::new(&path);
-        let (idx, rebuilt) = index::load_or_rebuild(root_path)?;
-        if rebuilt {
+    // --use-index：加载或增量更新索引
+    let candidate_paths: Option<Vec<String>> = if use_index && mode == Mode::Content {
+        let root_path = Path::new(&path);
+        let (idx, updated) = index::load_or_update(root_path)?;
+        if updated {
             eprintln!("fsearch: 索引已建立或更新");
         }
         match patterns_opt.as_ref().and_then(|v| v.first()) {
@@ -288,13 +319,12 @@ fn run() -> Result<bool> {
         None
     };
 
-    // 遍历器（非索引模式使用）
     let mut builder = WalkBuilder::new(&path);
     builder
         .hidden(!want_hidden)
-        .follow_links(cli.follow)
+        .follow_links(cli.follow.or(cfg.follow).unwrap_or(false))
         .require_git(false);
-    if let Some(d) = cli.max_depth {
+    if let Some(d) = max_depth {
         builder.max_depth(Some(d));
     }
     if no_ignore {
@@ -305,14 +335,13 @@ fn run() -> Result<bool> {
             .git_exclude(false);
     }
 
-    let has_overrides =
-        cli.glob.is_some() || !cli.type_filter.is_empty() || !cli.type_not_filter.is_empty();
+    let has_overrides = glob.is_some() || !type_filter.is_empty() || !type_not_filter.is_empty();
     if has_overrides {
         let mut ob = OverrideBuilder::new(&path);
-        if let Some(glob) = &cli.glob {
-            ob.add(glob)?;
+        if let Some(g) = &glob {
+            ob.add(g)?;
         }
-        for t in &cli.type_filter {
+        for t in &type_filter {
             let exts = extensions_for_type(t).ok_or_else(|| {
                 anyhow::anyhow!(
                     "未知的文件类型: {}（可用：rust, python, js, ts, go, c, cpp, markdown, toml, yaml, json 等）",
@@ -323,7 +352,7 @@ fn run() -> Result<bool> {
                 ob.add(&format!("*.{}", ext))?;
             }
         }
-        for t in &cli.type_not_filter {
+        for t in &type_not_filter {
             let exts =
                 extensions_for_type(t).ok_or_else(|| anyhow::anyhow!("未知的文件类型: {}", t))?;
             for ext in exts {
@@ -333,17 +362,17 @@ fn run() -> Result<bool> {
         builder.overrides(ob.build()?);
     }
 
-    let color_choice = if cli.json {
+    let color_choice = if json {
         termcolor::ColorChoice::Never
     } else {
-        choose_color(&cli.color)
+        choose_color(&color)
     };
     let mut output = if quiet {
         Output::Null
-    } else if cli.json {
+    } else if json {
         Output::Json(JsonPrinter::new())
     } else {
-        Output::Plain(Printer::new(color_choice, cli.line_number))
+        Output::Plain(Printer::new(color_choice, line_number))
     };
 
     let any_found = Arc::new(AtomicBool::new(false));
@@ -351,22 +380,17 @@ fn run() -> Result<bool> {
     let files_matched = Arc::new(AtomicUsize::new(0));
     let total_matches = Arc::new(AtomicUsize::new(0));
 
-    let files_with_matches = cli.files_with_matches;
-    let invert = cli.invert;
-    let only_matching = cli.only_matching;
-    let max_count = cli.max_count;
     let name_mode = mode == Mode::Name;
     let files_mode = mode == Mode::Files;
 
     if let Some(paths) = candidate_paths {
-        // 索引模式：只遍历候选文件
         let re_ref = re
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("内部错误：索引模式下正则缺失"))?;
         let shared = Arc::new(Mutex::new(output));
         for path_str in &paths {
             files_scanned.fetch_add(1, Ordering::Relaxed);
-            let p = std::path::Path::new(path_str);
+            let p = Path::new(path_str);
             if let Some(max) = max_filesize {
                 if let Ok(meta) = std::fs::metadata(p) {
                     if meta.len() > max {
@@ -621,8 +645,8 @@ fn run() -> Result<bool> {
     let m_count = total_matches.load(Ordering::Relaxed);
     let elapsed = start.elapsed();
 
-    if cli.stats {
-        if cli.json {
+    if stats {
+        if json {
             let _ = output.print_summary(scanned, matched, m_count, elapsed.as_nanos());
         } else {
             eprintln!(

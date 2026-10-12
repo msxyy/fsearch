@@ -7,12 +7,15 @@ use std::time::UNIX_EPOCH;
 use anyhow::Result;
 use ignore::WalkBuilder;
 
-const MAGIC: &[u8; 8] = b"FSIDX001";
+const MAGIC: &[u8; 8] = b"FSIDX002";
 
+#[derive(Clone)]
 struct FileEntry {
     path: String,
     size: u64,
     mtime: u64,
+    /// 该文件内容里出现的所有 3-gram（可能有重复）
+    trigrams: Vec<[u8; 3]>,
 }
 
 pub struct Index {
@@ -20,11 +23,38 @@ pub struct Index {
     trigrams: HashMap<[u8; 3], Vec<u32>>,
 }
 
+/// 从文件内容提取所有 3-gram（转小写后按字节切）
+fn extract_trigrams(content: &[u8]) -> Vec<[u8; 3]> {
+    if content.len() < 3 {
+        return Vec::new();
+    }
+    let lower: Vec<u8> = content.iter().map(|b| b.to_ascii_lowercase()).collect();
+    let mut tris = Vec::with_capacity(lower.len() - 2);
+    for i in 0..=lower.len() - 3 {
+        tris.push([lower[i], lower[i + 1], lower[i + 2]]);
+    }
+    tris
+}
+
+/// 从全局倒排表重建：把每个文件的 trigrams 展开进去
+fn rebuild_inverted(files: &[FileEntry]) -> HashMap<[u8; 3], Vec<u32>> {
+    let mut trigrams: HashMap<[u8; 3], Vec<u32>> = HashMap::new();
+    for (id, f) in files.iter().enumerate() {
+        for tri in &f.trigrams {
+            trigrams.entry(*tri).or_default().push(id as u32);
+        }
+    }
+    for ids in trigrams.values_mut() {
+        ids.sort_unstable();
+        ids.dedup();
+    }
+    trigrams
+}
+
 impl Index {
-    /// 为目录建立新索引（重新扫描全部文件）
+    /// 从零构建索引（读取所有文件）
     pub fn build(root: &Path) -> Result<Self> {
         let mut files = Vec::new();
-        let mut trigrams: HashMap<[u8; 3], Vec<u32>> = HashMap::new();
 
         let walker = WalkBuilder::new(root)
             .hidden(true)
@@ -59,29 +89,93 @@ impl Index {
                 continue;
             }
 
-            let file_id = files.len() as u32;
+            let trigrams = extract_trigrams(&content);
+            files.push(FileEntry {
+                path: path.display().to_string(),
+                size,
+                mtime,
+                trigrams,
+            });
+        }
+
+        let trigrams = rebuild_inverted(&files);
+        Ok(Index { files, trigrams })
+    }
+
+    /// 增量更新：复用旧索引里未变化文件的 trigram，只重新读变化的文件
+    ///
+    /// `old` 是之前的索引；为 `None` 时等价于全量构建。
+    pub fn update(root: &Path, old: Option<&Index>) -> Result<Self> {
+        // 旧索引按路径索引
+        let old_by_path: HashMap<&str, &FileEntry> = match old {
+            Some(idx) => idx.files.iter().map(|f| (f.path.as_str(), f)).collect(),
+            None => HashMap::new(),
+        };
+
+        let mut files: Vec<FileEntry> = Vec::new();
+        let mut reused = 0usize;
+        let mut reindexed = 0usize;
+
+        let walker = WalkBuilder::new(root)
+            .hidden(true)
+            .require_git(false)
+            .build();
+
+        for entry in walker.flatten() {
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            if path.file_name().and_then(|s| s.to_str()) == Some(".fsearch-index") {
+                continue;
+            }
+            let metadata = match fs::metadata(path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let size = metadata.len();
+            let mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
             let path_str = path.display().to_string();
 
-            let lower: Vec<u8> = content.iter().map(|b| b.to_ascii_lowercase()).collect();
-            if lower.len() >= 3 {
-                for i in 0..=lower.len() - 3 {
-                    let tri = [lower[i], lower[i + 1], lower[i + 2]];
-                    trigrams.entry(tri).or_default().push(file_id);
+            // 未变化 → 复用旧条目（含 trigrams）
+            if let Some(old_entry) = old_by_path.get(path_str.as_str()) {
+                if old_entry.size == size && old_entry.mtime == mtime {
+                    files.push((*old_entry).clone());
+                    reused += 1;
+                    continue;
                 }
             }
 
+            // 新文件或已变化 → 重新读取内容
+            let content = match fs::read(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if content.contains(&0) {
+                continue;
+            }
+            let trigrams = extract_trigrams(&content);
             files.push(FileEntry {
                 path: path_str,
                 size,
                 mtime,
+                trigrams,
             });
+            reindexed += 1;
         }
 
-        for ids in trigrams.values_mut() {
-            ids.sort_unstable();
-            ids.dedup();
-        }
+        eprintln!(
+            "fsearch: 索引更新完成（复用 {} 个，重建 {} 个）",
+            reused, reindexed
+        );
 
+        let trigrams = rebuild_inverted(&files);
         Ok(Index { files, trigrams })
     }
 
@@ -93,14 +187,20 @@ impl Index {
         w.write_all(&(self.files.len() as u32).to_le_bytes())?;
         w.write_all(&(self.trigrams.len() as u32).to_le_bytes())?;
 
+        // 文件区：路径、大小、mtime、该文件的 trigram 列表
         for f in &self.files {
             let pb = f.path.as_bytes();
             w.write_all(&(pb.len() as u32).to_le_bytes())?;
             w.write_all(pb)?;
             w.write_all(&f.size.to_le_bytes())?;
             w.write_all(&f.mtime.to_le_bytes())?;
+            w.write_all(&(f.trigrams.len() as u32).to_le_bytes())?;
+            for tri in &f.trigrams {
+                w.write_all(tri)?;
+            }
         }
 
+        // 倒排表区
         for (tri, ids) in &self.trigrams {
             w.write_all(tri)?;
             w.write_all(&(ids.len() as u32).to_le_bytes())?;
@@ -120,7 +220,7 @@ impl Index {
         let mut magic = [0u8; 8];
         r.read_exact(&mut magic)?;
         if &magic != MAGIC {
-            anyhow::bail!("索引文件格式不正确（magic 不匹配）");
+            anyhow::bail!("索引文件格式不正确（magic 不匹配，可能是旧版本索引）");
         }
 
         let mut buf4 = [0u8; 4];
@@ -143,7 +243,21 @@ impl Index {
             r.read_exact(&mut buf8)?;
             let mtime = u64::from_le_bytes(buf8);
 
-            files.push(FileEntry { path, size, mtime });
+            r.read_exact(&mut buf4)?;
+            let tri_count = u32::from_le_bytes(buf4) as usize;
+            let mut trigrams = Vec::with_capacity(tri_count);
+            for _ in 0..tri_count {
+                let mut tri = [0u8; 3];
+                r.read_exact(&mut tri)?;
+                trigrams.push(tri);
+            }
+
+            files.push(FileEntry {
+                path,
+                size,
+                mtime,
+                trigrams,
+            });
         }
 
         let mut trigrams = HashMap::with_capacity(trigram_count);
@@ -163,14 +277,8 @@ impl Index {
         Ok(Index { files, trigrams })
     }
 
-    /// 检查索引相对磁盘上的当前状态是否已过期
-    ///
-    /// 满足下列任一条件即视为过期：
-    /// - 有文件不存在了
-    /// - 有文件的 size 或 mtime 变了
-    /// - 目录下出现了索引里没有的新文件
+    /// 索引是否已过期（任何文件 size/mtime 变了，或有新文件/删除文件）
     pub fn is_stale(&self, root: &Path) -> bool {
-        // 先按索引里的清单检查
         for f in &self.files {
             let p = Path::new(&f.path);
             let metadata = match fs::metadata(p) {
@@ -191,7 +299,6 @@ impl Index {
             }
         }
 
-        // 再查有没有索引里没记录的新文件
         let walker = WalkBuilder::new(root)
             .hidden(true)
             .require_git(false)
@@ -282,26 +389,41 @@ pub fn build_and_save(root: &Path) -> Result<usize> {
     Ok(index.file_count())
 }
 
-/// 加载索引；不存在或过期则重建
+/// 加载索引并增量更新
 ///
-/// 返回 `(index, rebuilt)`：
-/// - `rebuilt = true` 表示索引被创建或重建
-/// - `rebuilt = false` 表示直接用了磁盘上的旧索引
-pub fn load_or_rebuild(root: &Path) -> Result<(Index, bool)> {
+/// 返回 `(index, updated)`：
+/// - `updated = true` 表示索引被创建或更新过
+/// - `updated = false` 表示磁盘上的索引仍然新鲜，直接返回
+///
+/// 若磁盘上没有索引，或索引是老格式（FSIDX001），会走全量构建。
+pub fn load_or_update(root: &Path) -> Result<(Index, bool)> {
     let idx_path = index_path(root);
-    if !idx_path.exists() {
-        let idx = Index::build(root)?;
-        idx.save(&idx_path)?;
-        return Ok((idx, true));
-    }
-    let idx = Index::load(&idx_path)?;
-    if idx.is_stale(root) {
-        let new_idx = Index::build(root)?;
-        new_idx.save(&idx_path)?;
-        Ok((new_idx, true))
+
+    // 尝试加载旧索引
+    let old = if idx_path.exists() {
+        match Index::load(&idx_path) {
+            Ok(idx) => Some(idx),
+            Err(_) => {
+                // 格式不对或损坏，删掉走全量
+                let _ = fs::remove_file(&idx_path);
+                None
+            }
+        }
     } else {
-        Ok((idx, false))
+        None
+    };
+
+    // 有旧索引且新鲜 → 直接用
+    if let Some(ref idx) = old {
+        if !idx.is_stale(root) {
+            return Ok((old.unwrap(), false));
+        }
     }
+
+    // 增量更新（old 为 None 时全量）
+    let new_idx = Index::update(root, old.as_ref())?;
+    new_idx.save(&idx_path)?;
+    Ok((new_idx, true))
 }
 
 #[cfg(test)]
@@ -435,7 +557,6 @@ mod tests {
         let index = Index::build(&dir.0).unwrap();
         assert!(!index.is_stale(&dir.0));
 
-        // 改内容，size 和 mtime 都会变
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std_fs::write(dir.0.join("a.txt"), "hello world, longer\n").unwrap();
         assert!(index.is_stale(&dir.0));
@@ -460,37 +581,125 @@ mod tests {
     }
 
     #[test]
-    fn load_or_rebuild_creates_when_missing() {
+    fn load_or_update_creates_when_missing() {
         let dir = TempDir::new("lorb_new");
         dir.file("a.txt", "hello\n");
 
-        let (idx, rebuilt) = load_or_rebuild(&dir.0).unwrap();
-        assert!(rebuilt);
+        let (idx, updated) = load_or_update(&dir.0).unwrap();
+        assert!(updated);
         assert_eq!(idx.file_count(), 1);
         assert!(index_path(&dir.0).exists());
     }
 
     #[test]
-    fn load_or_rebuild_reuses_when_fresh() {
+    fn load_or_update_reuses_when_fresh() {
         let dir = TempDir::new("lorb_fresh");
         dir.file("a.txt", "hello\n");
 
-        let (_, _) = load_or_rebuild(&dir.0).unwrap();
-        let (_, rebuilt) = load_or_rebuild(&dir.0).unwrap();
-        assert!(!rebuilt);
+        let (_, _) = load_or_update(&dir.0).unwrap();
+        let (_, updated) = load_or_update(&dir.0).unwrap();
+        assert!(!updated);
     }
 
     #[test]
-    fn load_or_rebuild_rebuilds_when_stale() {
+    fn load_or_update_rebuilds_when_stale() {
         let dir = TempDir::new("lorb_stale");
         dir.file("a.txt", "hello\n");
 
-        let (_, _) = load_or_rebuild(&dir.0).unwrap();
+        let (_, _) = load_or_update(&dir.0).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
         dir.file("b.txt", "new\n");
 
-        let (idx, rebuilt) = load_or_rebuild(&dir.0).unwrap();
-        assert!(rebuilt);
+        let (idx, updated) = load_or_update(&dir.0).unwrap();
+        assert!(updated);
         assert_eq!(idx.file_count(), 2);
+    }
+
+    // ---------- 增量更新专项 ----------
+
+    #[test]
+    fn update_reuses_unchanged_trigrams() {
+        let dir = TempDir::new("up_reuse");
+        dir.file("a.txt", "hello world\n");
+        dir.file("b.txt", "foo bar\n");
+
+        let idx1 = Index::build(&dir.0).unwrap();
+        // 没变过，update 后内容应完全一致
+        let idx2 = Index::update(&dir.0, Some(&idx1)).unwrap();
+        assert_eq!(idx2.file_count(), 2);
+        assert_eq!(idx2.candidates("hello").unwrap().len(), 1);
+        assert_eq!(idx2.candidates("foo").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn update_picks_up_new_file() {
+        let dir = TempDir::new("up_new");
+        dir.file("a.txt", "hello world\n");
+
+        let idx1 = Index::build(&dir.0).unwrap();
+        dir.file("b.txt", "needle here\n");
+
+        let idx2 = Index::update(&dir.0, Some(&idx1)).unwrap();
+        assert_eq!(idx2.file_count(), 2);
+        let cands = idx2.candidates("needle").unwrap();
+        assert_eq!(cands.len(), 1);
+        assert!(cands[0].contains("b.txt"));
+    }
+
+    #[test]
+    fn update_removes_deleted_file() {
+        let dir = TempDir::new("up_del");
+        let p = dir.file("a.txt", "hello\n");
+        dir.file("b.txt", "world\n");
+
+        let idx1 = Index::build(&dir.0).unwrap();
+        std_fs::remove_file(&p).unwrap();
+
+        let idx2 = Index::update(&dir.0, Some(&idx1)).unwrap();
+        assert_eq!(idx2.file_count(), 1);
+        let cands = idx2.candidates("hello").unwrap();
+        assert!(cands.is_empty());
+    }
+
+    #[test]
+    fn update_reindexes_changed_file() {
+        let dir = TempDir::new("up_change");
+        dir.file("a.txt", "hello\n");
+
+        let idx1 = Index::build(&dir.0).unwrap();
+        assert_eq!(idx1.candidates("hello").unwrap().len(), 1);
+        assert!(idx1.candidates("needle").unwrap().is_empty());
+
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std_fs::write(dir.0.join("a.txt"), "needle here\n").unwrap();
+
+        let idx2 = Index::update(&dir.0, Some(&idx1)).unwrap();
+        assert!(idx2.candidates("hello").unwrap().is_empty());
+        assert_eq!(idx2.candidates("needle").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn update_with_none_is_full_build() {
+        let dir = TempDir::new("up_none");
+        dir.file("a.txt", "hello\n");
+
+        let idx = Index::update(&dir.0, None).unwrap();
+        assert_eq!(idx.file_count(), 1);
+    }
+
+    #[test]
+    fn old_format_magic_is_rejected() {
+        let dir = TempDir::new("old_magic");
+        // 写一个 FSIDX001 的假文件
+        let p = dir.0.join(".fsearch-index");
+        std_fs::write(&p, b"FSIDX001this is old format").unwrap();
+
+        let result = Index::load(&p);
+        assert!(result.is_err());
+
+        // load_or_update 应该丢弃旧索引并重建
+        let (idx, updated) = load_or_update(&dir.0).unwrap();
+        assert!(updated);
+        assert_eq!(idx.file_count(), 0);
     }
 }

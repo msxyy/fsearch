@@ -6,3 +6,4 @@ test.txt
 fsearch.bash
 fsearch.ps1
 fsearch.1
+.fsearch.toml

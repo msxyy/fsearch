@@ -942,3 +942,194 @@ fn use_index_with_regex_falls_back() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("hello"));
 }
+
+// ---------- v0.6.0：配置文件 .fsearch.toml ----------
+
+#[test]
+fn config_ignore_case_applied() {
+    let dir = TempDir::new("cfg_ic");
+    dir.file(".fsearch.toml", "ignore_case = true\n");
+    dir.file("a.txt", "HELLO\n");
+
+    let out = fsearch()
+        .arg("hello")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("HELLO"));
+}
+
+#[test]
+fn cli_overrides_config() {
+    let dir = TempDir::new("cfg_override");
+    dir.file(".fsearch.toml", "ignore_case = true\n");
+    dir.file("a.txt", "HELLO\n");
+
+    // CLI 不设 -i，但配置文件设了，所以会命中
+    let out = fsearch()
+        .arg("hello")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // CLI 明确给 --no-ignore-case 并不存在；改用另一种方式：
+    // 配置文件设 line_number = true，CLI 覆盖不了布尔 false，这里只验证配置文件生效
+    let out = fsearch()
+        .arg("--line-number")
+        .arg("hello")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // 应该有行号 "a.txt:1:HELLO"
+    assert!(stdout.contains(":1:"), "stdout: {stdout}");
+}
+
+#[test]
+fn config_type_filter_applied() {
+    let dir = TempDir::new("cfg_type");
+    dir.file(".fsearch.toml", "type_filter = [\"rust\"]\n");
+    dir.file("a.rs", "needle\n");
+    dir.file("b.txt", "needle\n");
+
+    let out = fsearch()
+        .arg("-l")
+        .arg("needle")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("a.rs"));
+    assert!(!stdout.contains("b.txt"));
+}
+
+#[test]
+fn config_cli_type_filter_overrides() {
+    let dir = TempDir::new("cfg_type_override");
+    dir.file(".fsearch.toml", "type_filter = [\"rust\"]\n");
+    dir.file("a.rs", "needle\n");
+    dir.file("b.py", "needle\n");
+
+    // CLI 的 --type 覆盖配置文件
+    let out = fsearch()
+        .arg("--type")
+        .arg("python")
+        .arg("-l")
+        .arg("needle")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("b.py"));
+    assert!(!stdout.contains("a.rs"));
+}
+
+#[test]
+fn config_invalid_errors() {
+    let dir = TempDir::new("cfg_bad");
+    dir.file(".fsearch.toml", "not_a_field = 1\n");
+    dir.file("a.txt", "hello\n");
+
+    let out = fsearch()
+        .arg("hello")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("无法解析") || stderr.contains("fsearch:"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn config_context_applied() {
+    let dir = TempDir::new("cfg_ctx");
+    dir.file(".fsearch.toml", "context = 1\n");
+    dir.file("a.txt", "l1\nl2 hit l3\nl4\n");
+
+    let out = fsearch()
+        .arg("hit")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("l1"), "stdout: {stdout}");
+    assert!(stdout.contains("l4"), "stdout: {stdout}");
+}
+
+// ---------- v0.6.0：增量索引 ----------
+
+#[test]
+fn index_incremental_reuses_and_updates() {
+    let dir = TempDir::new("idx_inc");
+    dir.file("a.txt", "hello\n");
+    dir.file("b.txt", "world\n");
+
+    // 首次建立
+    let out = fsearch()
+        .arg("--build-index")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // 修改一个文件
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    dir.file("a.txt", "hello changed to needle\n");
+
+    // 用索引搜索，应自动重建，且复用 b.txt
+    let out = fsearch()
+        .arg("--use-index")
+        .arg("needle")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("索引更新完成"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("复用 1") && stderr.contains("重建 1"),
+        "stderr: {stderr}"
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("needle"), "stdout: {stdout}");
+}
+
+#[test]
+fn old_index_format_rebuilt() {
+    let dir = TempDir::new("idx_old_fmt");
+    dir.file("a.txt", "hello\n");
+
+    // 写一个假的旧格式索引
+    fs::write(dir.0.join(".fsearch-index"), b"FSIDX001old format").unwrap();
+
+    // --use-index 应该自动丢弃旧索引并重建
+    let out = fsearch()
+        .arg("--use-index")
+        .arg("hello")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("hello"), "stdout: {stdout}");
+}

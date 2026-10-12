@@ -39,7 +39,8 @@
 - `-u` / `-uu` / `-uuu` 逐级放宽忽略规则
 - 递归深度 `--max-depth`、文件大小 `--max-filesize`
 - 静默模式 `-q`
-- 增量索引 `--build-index` / `--use-index`，索引自动检测过期并重建
+- 增量索引 `--build-index` / `--use-index`，支持增量更新
+- 配置文件 `.fsearch.toml`
 - JSON Lines 输出 `--json`（含 begin/end/summary 事件）
 - Shell 补全生成 `--generate-completions`
 - Man 手册生成 `--generate-man`
@@ -91,6 +92,85 @@ let result = search_file(Path::new("src/main.rs"), &re, &opts)?;
 println!("{} 命中 {} 行", result.path, result.match_count);
 # Ok::<(), anyhow::Error>(())
 ```
+
+## 配置文件
+
+在搜索目录放一个 `.fsearch.toml`，为该目录及其子目录指定默认选项。命令行参数始终优先于配置文件。
+
+```toml
+# .fsearch.toml
+ignore_case = true
+line_number = true
+context = 2
+type_filter = ["rust", "toml"]
+type_not_filter = ["markdown"]
+max_depth = 5
+max_filesize = "1M"
+color = "always"
+```
+
+支持的字段：
+
+| 字段 | 类型 | 对应参数 |
+|------|------|----------|
+| `ignore_case` | bool | `-i` |
+| `line_number` | bool | `-n` |
+| `hidden` | bool | `--hidden` |
+| `follow` | bool | `--follow` |
+| `word` | bool | `-w` |
+| `invert` | bool | `-v` |
+| `fixed` | bool | `-F` |
+| `only_matching` | bool | `-o` |
+| `quiet` | bool | `-q` |
+| `no_ignore` | bool | `--no-ignore` |
+| `sort` | bool | `--sort` |
+| `stats` | bool | `--stats` |
+| `json` | bool | `--json` |
+| `context` | int | `-C N` |
+| `before` | int | `-B N` |
+| `after` | int | `-A N` |
+| `max_count` | int | `-m N` |
+| `max_depth` | int | `--max-depth N` |
+| `unrestricted` | int | `-u` 的级别（0–3） |
+| `color` | string | `--color MODE` |
+| `encoding` | string | `--encoding ENC` |
+| `glob` | string | `-g GLOB` |
+| `max_filesize` | string | `--max-filesize SIZE` |
+| `replace` | string | `-r TEXT` |
+| `type_filter` | list | `--type` |
+| `type_not_filter` | list | `--type-not` |
+
+未知字段会导致解析错误，避免拼写错误被静默忽略。
+
+## 增量索引
+
+对固定目录反复搜索时，可以预先建立索引，后续搜索只扫描可能命中的文件。
+
+```bash
+# 首次：建立索引
+fsearch --build-index ./src
+
+# 之后：使用索引
+fsearch --use-index "fn main" ./src
+fsearch --use-index "Result" ./src
+```
+
+索引文件保存在目标目录下的 `.fsearch-index`，包含：
+
+- 所有非二进制文件的路径、大小、修改时间
+- 每个文件的 3-gram（三字节序列）列表
+- 从 3-gram 到文件 ID 的全局倒排表
+
+搜索时把 pattern 拆成 3-gram，取交集得到候选文件，只在候选文件里做精确正则搜索。
+
+**自动更新**：`--use-index` 会检查每个文件的 size 和 mtime，以及目录下是否有新文件。
+索引过期或不存在时会**增量更新**——只重建变化的文件，未变化的文件直接复用旧索引，输出：
+
+```
+fsearch: 索引更新完成（复用 100 个，重建 3 个）
+```
+
+只支持**长度 ≥ 3 的字面量 pattern**；含正则元字符时自动回退到全量扫描。
 
 ## Shell 补全与 man 手册
 
@@ -207,7 +287,7 @@ fsearch --encoding gbk "中文" .
 # 为目录建立内容索引
 fsearch --build-index ./src
 
-# 使用索引加速搜索（索引会自动检测过期并重建）
+# 使用索引加速搜索（索引会自动检测过期并增量更新）
 fsearch --use-index "fn main" ./src
 
 # JSON Lines 输出
@@ -273,7 +353,7 @@ fsearch --json "fn main" ./src
 |----|------|
 | 0 | 找到至少一处匹配 |
 | 1 | 没有找到任何匹配 |
-| 2 | 出错（正则非法、路径不存在、未知类型等） |
+| 2 | 出错（正则非法、路径不存在、未知类型、配置解析失败等） |
 
 与 `grep`、`rg`、`fd` 的约定一致，方便在脚本和 CI 里使用。
 
@@ -318,35 +398,6 @@ fsearch --json "fn main" ./src
 
 指定非 UTF-8 编码时，整个文件会被解码到内存再搜索；默认 UTF-8 走流式，内存占用与文件大小无关。
 
-## 增量索引
-
-对固定目录反复搜索时，可以预先建立索引，后续搜索只扫描可能命中的文件。
-
-```bash
-# 首次：建立索引
-fsearch --build-index ./src
-# 输出：fsearch: 已索引 4 个文件，保存到 ./src/.fsearch-index
-
-# 之后：使用索引
-fsearch --use-index "fn main" ./src
-fsearch --use-index "Result" ./src
-```
-
-索引文件保存在目标目录下的 `.fsearch-index`，是一个二进制文件，包含：
-
-- 所有非二进制、非空文件的路径、大小、修改时间
-- 从文件内容提取的所有 3-gram（三字节序列）到文件 ID 的倒排表
-
-搜索时：
-
-- 把 pattern 拆成 3-gram，取交集得到候选文件
-- 只在候选文件里做精确正则搜索
-- 只支持**长度 ≥ 3 的字面量 pattern**
-- pattern 含正则元字符时自动回退到全量扫描，并打印提示
-
-**自动更新**：`--use-index` 会检查每个文件的 size 和 mtime，以及目录下是否有新文件。
-索引过期或不存在时会自动重建，不需要手动再跑 `--build-index`。
-
 ## 字面量预筛
 
 对 `-F` 或纯字面量 pattern，`fsearch` 会自动启用字面量预筛：
@@ -363,7 +414,7 @@ fsearch --use-index "Result" ./src
 
 ## JSON 输出格式
 
-`--json` 模式下每行一个独立的 JSON 对象，方便被工具或脚本逐行解析。
+`--json` 模式下每行一个独立的 JSON 对象。
 
 每个文件的输出以 `begin` 事件开始，`end` 事件结束：
 
@@ -374,8 +425,6 @@ fsearch --use-index "Result" ./src
 {"type":"separator"}
 {"type":"end","path":"./src/main.rs"}
 ```
-
-`submatches` 是匹配在一行中的字节区间数组。
 
 `-c` / `--count-matches` 模式下的统计事件：
 
@@ -408,10 +457,11 @@ src/
 ├── lib.rs      # 库入口，导出所有公共 API
 ├── main.rs     # CLI 入口，参数组装、并行遍历
 ├── cli.rs      # clap 参数定义
+├── config.rs   # .fsearch.toml 配置文件解析
 ├── pattern.rs  # 正则模式构建、字面量识别
 ├── search.rs   # 单文件流式搜索、字面量预筛
 ├── printer.rs  # 输出（普通 / JSON / 静默）
-└── index.rs    # 增量索引（3-gram 倒排表、自动更新）
+└── index.rs    # 增量索引（3-gram 倒排表、增量更新）
 
 tests/
 └── cli.rs      # 集成测试
@@ -426,10 +476,10 @@ benches/
 cargo test
 ```
 
-包含 **109 个测试**：
+包含 **129 个测试**：
 
-- 67 个库单元测试：搜索逻辑、参数组装、JSON 转义、多模式合并、大小解析、索引、字面量预筛
-- 41 个集成测试：调用真实 exe，验证端到端行为
+- 79 个库单元测试：搜索、参数组装、JSON 转义、多模式合并、索引、字面量预筛、配置解析
+- 49 个集成测试：调用真实 exe，验证端到端行为
 - 1 个 doc-test
 
 ## 代码质量
@@ -459,10 +509,10 @@ hyperfine --warmup 3 \
   "rg -n 'fn ' ./src"
 ```
 
-`rg` 通常更快，它做了内存映射、SIMD、更深的并行管线等优化。`fsearch` 现在有字面量预筛和增量索引两条加速路径：
+`fsearch` 有两条加速路径：
 
-- 一次性搜索：字面量预筛自动启用
-- 反复搜索同一目录：`--build-index` 建索引，之后 `--use-index` 查询只扫候选文件
+- **一次性搜索**：字面量预筛自动启用，用 `aho-corasick` 跳过不可能命中的行
+- **反复搜索同一目录**：`--build-index` 建索引，之后 `--use-index` 只扫候选文件，索引变化时增量更新
 
 项目内自带简易 benchmark：
 
@@ -478,20 +528,21 @@ cargo bench
 - **非 UTF-8 安全**：非法字节用替代字符替换，不会中断搜索
 - **二进制检测**：读取前 8KB，遇到 `\0` 跳过（`-uuu` 时也搜索）
 - **输出原子性**：每个文件的结果整体加锁打印，不会交错
-- **`-m` 与上下文**：达到 `-m` 上限后仍会输出当前匹配的 after 上下文，与 ripgrep 行为一致
+- **`-m` 与上下文**：达到 `-m` 上限后仍会输出当前匹配的 after 上下文
 - **`--replace` 与高亮**：替换后清空匹配区间，避免字节偏移越界
-- **`.gitignore` 生效范围**：即使不在 git 仓库里，也会读取 `.gitignore`（通过 `require_git(false)`）
+- **`.gitignore` 生效范围**：通过 `require_git(false)` 让非 git 目录也读 `.gitignore`
 - **`--sort` 模式**：并行搜索，收集结果后按路径排序，再串行打印
-- **`-e` 与位置参数**：有 `-e` 时，位置参数被当作路径；无 `-e` 时，位置参数当作模式
-- **增量索引**：3-gram 倒排表，pattern 拆 trigram 取交集得到候选文件；检查 size 和 mtime 自动判定过期
-- **字面量预筛**：`aho-corasick` 快速排除不可能命中的行；命中后仍跑 regex，保证语义正确
-- **库 + 二进制**：核心逻辑在 `lib.rs`，CLI 只是薄薄一层；第三方可依赖库
+- **`-e` 与位置参数**：有 `-e` 时，位置参数被当作路径
+- **增量索引**：3-gram 倒排表 + 每文件 trigram 列表；更新时只重建变化文件
+- **字面量预筛**：`aho-corasick` 快速排除不可能命中的行，命中后仍跑 regex 保证语义
+- **库 + 二进制**：核心逻辑在 `lib.rs`，CLI 只是薄薄一层
+- **配置文件**：`.fsearch.toml` 提供目录级默认选项，命令行参数始终优先
 
 ## 后续规划
 
-- [ ] 配置文件 `.fsearch.toml`
-- [ ] 索引支持增量更新（只重建变化的文件）
 - [ ] Windows 原生打包（Inno Setup / WiX）
+- [ ] Scoop / winget 分发
+- [ ] 索引持久化到用户目录（而非项目目录）
 
 ## 贡献
 
