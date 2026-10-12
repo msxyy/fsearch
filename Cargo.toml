@@ -2,13 +2,12 @@
 name = "fsearch"
 version = "0.1.0"
 edition = "2021"
-authors = ["Your Name <you@example.com>"]
+authors = ["msxyy"]
 description = "用 Rust 写的文件内容搜索器，ripgrep 简化版"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/yourname/fsearch"
-homepage = "https://github.com/yourname/fsearch"
-documentation = "https://docs.rs/fsearch"
+repository = "https://github.com/msxyy/fsearch"
+homepage = "https://github.com/msxyy/fsearch"
 keywords = ["search", "grep", "cli", "ripgrep"]
 categories = ["command-line-utilities"]
 exclude = ["/.github", "/benches"]

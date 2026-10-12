@@ -1,6 +1,23 @@
 # fsearch
 
+[![CI](https://github.com/msxyy/fsearch/actions/workflows/ci.yml/badge.svg)](https://github.com/msxyy/fsearch/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
+
 用 Rust 写的文件内容搜索器，是 ripgrep 的简化版。
+
+## 下载
+
+不想自己编译？直接下载预编译版本：
+
+到 [Releases](https://github.com/msxyy/fsearch/releases) 页面，下载对应平台的压缩包，解压后即可使用。
+
+| 平台 | 文件 |
+|------|------|
+| Windows x86_64 | `fsearch-windows-x86_64.zip` |
+| Linux x86_64 | `fsearch-linux-x86_64.tar.gz` |
+| macOS Intel | `fsearch-macos-x86_64.tar.gz` |
+| macOS Apple Silicon | `fsearch-macos-aarch64.tar.gz` |
 
 ## 特性
 
@@ -11,6 +28,8 @@
 - 全词匹配 `-w`、反向匹配 `-v`、固定字符串 `-F`
 - 只输出匹配部分 `-o`
 - 按文件类型过滤 `--type rust`
+- 按文件名搜索 `--name`、只列文件 `--files`
+- 每文件上限 `-m N`、统计 `--stats`
 - JSON Lines 输出 `--json`
 - 并行遍历（`ignore` 的并行 Walker）
 - 流式逐行搜索，内存与文件大小无关
@@ -19,16 +38,24 @@
 
 ## 安装
 
-从源码安装：
+### 方式一：下载二进制（推荐）
+
+见上文「下载」章节。
+
+### 方式二：从源码编译
 
 ```bash
-cargo install --path .
+git clone https://github.com/msxyy/fsearch.git
+cd fsearch
+cargo build --release
 ```
 
-安装后可在任意目录使用：
+编译好的 exe 在 `target/release/fsearch.exe`（Windows）或 `target/release/fsearch`（Linux/macOS）。
+
+### 方式三：cargo install
 
 ```bash
-fsearch "fn main" .
+cargo install --git https://github.com/msxyy/fsearch
 ```
 
 ## 用法
@@ -81,6 +108,21 @@ fsearch --type rust "Result" .
 # 只搜匹配 glob 的文件
 fsearch -g "*.toml" "version" .
 
+# 按文件名搜索
+fsearch --name "main" .
+
+# 只列出会被搜索的文件
+fsearch --files .
+
+# 每个文件最多输出 1 条匹配
+fsearch -m 1 "fn " ./src
+
+# 输出统计信息
+fsearch --stats "Result" ./src
+
+# 忽略 .gitignore
+fsearch --no-ignore -l "target" .
+
 # JSON Lines 输出
 fsearch --json "fn main" ./src
 
@@ -103,9 +145,14 @@ fsearch -i -n -C 1 --type rust "result" .
 | `-v` / `--invert` | 反向匹配，输出不含模式的行 |
 | `-F` / `--fixed` | 把模式当作固定字符串，不解释为正则 |
 | `-o` / `--only-matching` | 只输出匹配部分，而不是整行 |
+| `-m N` / `--max-count N` | 每个文件最多输出 N 条匹配 |
 | `-g GLOB` / `--glob` | 只搜索匹配 glob 的文件 |
 | `--type TYPE` | 按文件类型过滤，可重复 |
+| `--name` | 按文件名搜索，不搜索文件内容 |
+| `--files` | 只列出会被搜索的文件，不搜索内容 |
 | `--json` | 以 JSON Lines 格式输出 |
+| `--stats` | 输出统计信息（扫描文件数、匹配数、耗时） |
+| `--no-ignore` | 不读取 `.gitignore` / `.ignore` |
 | `--color MODE` | 颜色模式：`auto` / `always` / `never` |
 | `--follow` | 跟随符号链接 |
 | `--hidden` | 搜索隐藏文件 |
@@ -159,25 +206,17 @@ fsearch -i -n -C 1 --type rust "result" .
 
 `--json` 模式下每行一个独立的 JSON 对象，方便被工具或脚本逐行解析。
 
-匹配行事件：
+每个文件的输出以 `begin` 事件开始，`end` 事件结束：
 
 ```json
+{"type":"begin","path":"./src/main.rs"}
 {"type":"match","path":"./src/main.rs","line_number":20,"line":"fn main() -> ExitCode {","submatches":[{"start":0,"end":7}]}
+{"type":"context","path":"./src/main.rs","line_number":21,"line":"    match run() {"}
+{"type":"separator"}
+{"type":"end","path":"./src/main.rs"}
 ```
 
 `submatches` 是匹配在一行中的字节区间数组。
-
-上下文行事件：
-
-```json
-{"type":"context","path":"./src/main.rs","line_number":21,"line":"    match run() {"}
-```
-
-分组分隔符事件：
-
-```json
-{"type":"separator"}
-```
 
 `-c` 模式下的统计事件：
 
@@ -197,6 +236,12 @@ fsearch -i -n -C 1 --type rust "result" .
 {"type":"match","path":"./src/main.rs","line_number":20,"match":"fn main"}
 ```
 
+`--stats` 模式末尾的汇总事件：
+
+```json
+{"type":"summary","files_scanned":12,"files_matched":3,"matches":7,"elapsed_nanos":1234567}
+```
+
 ## 项目结构
 
 ```
@@ -208,6 +253,9 @@ src/
 
 tests/
 └── cli.rs      # 集成测试
+
+benches/
+└── search.rs   # 简易 benchmark
 ```
 
 ## 测试
@@ -216,10 +264,19 @@ tests/
 cargo test
 ```
 
-包含 **38 个测试**：
+包含 **47 个测试**：
 
-- 28 个单元测试：搜索逻辑、参数组装、JSON 转义
-- 10 个集成测试：调用真实 exe，验证端到端行为
+- 31 个单元测试：搜索逻辑、参数组装、JSON 转义
+- 16 个集成测试：调用真实 exe，验证端到端行为
+
+## 代码质量
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+```
+
+CI 会在 Ubuntu、Windows、macOS 三个平台上跑格式检查、clippy 和测试。
 
 ## 性能
 
@@ -241,6 +298,12 @@ hyperfine --warmup 3 \
 
 `rg` 通常更快，它做了字面量预筛、SIMD、内存映射、并行管线等更激进的优化。`fsearch` 的目标是**功能对等 + 流式内存**，而不是性能击败 `rg`。
 
+项目内自带简易 benchmark：
+
+```bash
+cargo bench
+```
+
 ## 设计要点
 
 - **并行搜索**：`ignore::WalkParallel` 遍历文件，多线程并行搜索
@@ -249,7 +312,22 @@ hyperfine --warmup 3 \
 - **非 UTF-8 安全**：非法字节用替代字符替换，不会中断搜索
 - **二进制检测**：读取前 8KB，遇到 `\0` 跳过
 - **输出原子性**：每个文件的结果整体加锁打印，不会交错
+- **`-m` 与上下文**：达到 `-m` 上限后仍会输出当前匹配的 after 上下文，与 ripgrep 行为一致
+- **`.gitignore` 生效范围**：即使不在 git 仓库里，也会读取 `.gitignore`（通过 `require_git(false)`）
+
+## 后续规划
+
+- [ ] `--type-not` 排除指定类型
+- [ ] `-u` / `-uu` / `-uuu` 逐级放宽忽略规则
+- [ ] `--sort path` 并行搜索但输出有序
+- [ ] `--encoding` 指定编码
+- [ ] `-e PATTERN` 支持多个模式
+- [ ] Shell 自动补全
+
+## 贡献
+
+欢迎提交 Issue 和 PR。
 
 ## 许可
 
-MIT
+本项目基于 [MIT 协议](LICENSE) 发布。
