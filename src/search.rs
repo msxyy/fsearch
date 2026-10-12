@@ -1,11 +1,12 @@
 use std::{
     collections::VecDeque,
-    fs::File,
+    fs::{self, File},
     io::{BufRead, BufReader, Read},
     path::Path,
 };
 
 use anyhow::Result;
+use encoding_rs::Encoding;
 use regex::Regex;
 
 /// 打印用的输出行
@@ -45,6 +46,12 @@ pub struct SearchOptions {
     pub only_matching: bool,
     /// 每个文件最多输出 N 条匹配；None 表示不限制
     pub max_count: Option<usize>,
+    /// 是否搜索二进制文件（-uuu 时启用）
+    pub search_binary: bool,
+    /// 文件编码；None 表示 UTF-8（流式），Some 表示指定编码（整体解码）
+    pub encoding: Option<&'static Encoding>,
+    /// 替换文本；None 表示不替换
+    pub replace: Option<String>,
 }
 
 /// 判断是否是二进制文件：读取前 8KB，包含 \0 视为二进制
@@ -65,13 +72,48 @@ fn find_matches(re: &Regex, line: &str) -> Vec<(usize, usize)> {
     re.find_iter(line).map(|m| (m.start(), m.end())).collect()
 }
 
-/// 对单个文件执行流式搜索，返回结果，不负责打印
-///
-/// 内存占用与文件大小无关：只保留 opts.before 行环形缓冲，
-/// 加上按需累积的输出行（-l / -c 模式下输出为空）。
-///
-/// `-m N` 限制匹配数，但不会截断当前匹配的 after 上下文：
-/// 达到上限后仍会把当前匹配的 after 上下文输出完再停。
+/// 把一行中的所有匹配替换成 replacement
+fn apply_replace(re: &Regex, line: &str, replacement: &str) -> String {
+    re.replace_all(line, replacement).into_owned()
+}
+
+/// 流式读取来源
+enum LineSource {
+    /// 逐字节读行，UTF-8 lossy
+    Stream {
+        reader: BufReader<File>,
+        buf: Vec<u8>,
+    },
+    /// 已整体解码到内存的行
+    Memory(std::vec::IntoIter<String>),
+}
+
+impl LineSource {
+    fn next_line(&mut self) -> Option<String> {
+        match self {
+            LineSource::Stream { reader, buf } => {
+                buf.clear();
+                match reader.read_until(b'\n', buf) {
+                    Ok(0) => None,
+                    Ok(n) => {
+                        let mut end = n;
+                        if end > 0 && buf[end - 1] == b'\n' {
+                            end -= 1;
+                        }
+                        if end > 0 && buf[end - 1] == b'\r' {
+                            end -= 1;
+                        }
+                        Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+                    }
+                    Err(_) => None,
+                }
+            }
+            LineSource::Memory(it) => it.next(),
+        }
+    }
+}
+
+/// 对单个文件执行搜索，返回结果，不负责打印
 pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<FileResult> {
     let path_str = path.display().to_string();
     let mut result = FileResult {
@@ -86,53 +128,49 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
         return Ok(result);
     }
 
-    if is_binary(path) {
+    // 默认跳过二进制；-uuu 时也搜索
+    if !opts.search_binary && is_binary(path) {
         return Ok(result);
     }
 
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Ok(result),
+    // 选择行来源：UTF-8 走流式，其他编码整体解码
+    let mut source = match opts.encoding {
+        Some(enc) if !std::ptr::eq(enc, encoding_rs::UTF_8) => {
+            let bytes = match fs::read(path) {
+                Ok(b) => b,
+                Err(_) => return Ok(result),
+            };
+            let (cow, _, _) = enc.decode(&bytes);
+            let lines: Vec<String> = cow.lines().map(String::from).collect();
+            LineSource::Memory(lines.into_iter())
+        }
+        _ => {
+            let file = match File::open(path) {
+                Ok(f) => f,
+                Err(_) => return Ok(result),
+            };
+            LineSource::Stream {
+                reader: BufReader::new(file),
+                buf: Vec::new(),
+            }
+        }
     };
 
     let build_output = !opts.files_with_matches && !opts.count;
-    // -o 模式忽略 before/after，只输出匹配文本
     let use_context = !opts.only_matching && (opts.before > 0 || opts.after > 0);
     let use_before = if opts.only_matching { 0 } else { opts.before };
     let use_after = if opts.only_matching { 0 } else { opts.after };
 
-    let mut reader = BufReader::new(file);
-    let mut buf: Vec<u8> = Vec::new();
-    // 环形缓冲：保存最近 use_before 行的 (行号, 内容)
     let mut ring: VecDeque<(usize, String)> = VecDeque::new();
-    // 当前匹配之后还需要输出多少行上下文
     let mut after_remaining: usize = 0;
-    // 上一次已打印的行号，用于判断是否需要分隔符
     let mut last_printed: Option<usize> = None;
     let mut line_no: usize = 0;
-    // 是否已达到 -m 上限
     let mut hit_limit = false;
 
-    loop {
-        buf.clear();
-        let n = match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
-        };
-        // 去掉行尾 \n 和 \r
-        let mut end = n;
-        if end > 0 && buf[end - 1] == b'\n' {
-            end -= 1;
-        }
-        if end > 0 && buf[end - 1] == b'\r' {
-            end -= 1;
-        }
-        // 非 UTF-8 字节用替代字符替换，不中断搜索
-        let line = String::from_utf8_lossy(&buf[..end]).into_owned();
+    while let Some(line) = source.next_line() {
         line_no += 1;
 
-        // 已达上限：只输出当前匹配剩余 after 上下文，不再判断新匹配
+        // 已达上限：只输出当前匹配剩余 after 上下文
         if hit_limit {
             if build_output && after_remaining > 0 {
                 result.output.push(OutputLine::Context {
@@ -189,7 +227,6 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
                         });
                     }
                 } else {
-                    // 普通匹配行：需要与上一次输出的行之间加分隔符
                     if use_context {
                         if let Some(lp) = last_printed {
                             if line_no > lp + 1 {
@@ -198,15 +235,24 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
                         }
                     }
 
-                    // 反向匹配时不高亮
-                    let matches = if opts.invert {
-                        Vec::new()
-                    } else {
-                        find_matches(re, &line)
+                    // 替换优先：如果指定 --replace，输出替换后的整行
+                    let (display_line, matches) = match &opts.replace {
+                        Some(rep) if !opts.invert => {
+                            // 替换后匹配位置已改变，不再高亮
+                            (apply_replace(re, &line, rep), Vec::new())
+                        }
+                        _ => {
+                            let m = if opts.invert {
+                                Vec::new()
+                            } else {
+                                find_matches(re, &line)
+                            };
+                            (line.clone(), m)
+                        }
                     };
                     result.output.push(OutputLine::Match {
                         line_no,
-                        line: line.clone(),
+                        line: display_line,
                         matches,
                     });
                 }
@@ -215,7 +261,6 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
                 after_remaining = use_after;
             }
 
-            // 达到 -m 上限：标记，但保留 after 上下文继续输出
             if let Some(max) = opts.max_count {
                 if result.match_count >= max {
                     hit_limit = true;
@@ -225,7 +270,6 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
                 }
             }
         } else if build_output && after_remaining > 0 {
-            // after 上下文：紧跟在匹配之后，不会出现分隔符
             result.output.push(OutputLine::Context {
                 line_no,
                 line: line.clone(),
@@ -234,7 +278,6 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
             after_remaining -= 1;
         }
 
-        // 维护 before 环形缓冲（始终 push 当前行，保持容量 = use_before）
         if build_output && use_before > 0 {
             ring.push_back((line_no, line));
             while ring.len() > use_before {
@@ -249,7 +292,6 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::path::PathBuf;
 
     struct TempDir(PathBuf);
@@ -275,6 +317,12 @@ mod tests {
             fs::write(&p, content).unwrap();
             p
         }
+
+        fn file_bytes(&self, name: &str, content: &[u8]) -> PathBuf {
+            let p = self.0.join(name);
+            fs::write(&p, content).unwrap();
+            p
+        }
     }
 
     impl Drop for TempDir {
@@ -292,6 +340,9 @@ mod tests {
             invert: false,
             only_matching: false,
             max_count: None,
+            search_binary: false,
+            encoding: None,
+            replace: None,
         }
     }
 
@@ -401,19 +452,28 @@ mod tests {
     }
 
     #[test]
-    fn binary_file_skipped() {
-        let dir = TempDir::new("bin");
-        let file = dir.file("a.bin", "hello\0world");
+    fn binary_skipped_by_default() {
+        let dir = TempDir::new("bin_skip");
+        let file = dir.file_bytes("a.bin", b"hello\0world");
         let r = search_file(&file, &re("hello"), &default_opts()).unwrap();
         assert!(!r.matched);
     }
 
     #[test]
+    fn binary_searched_when_enabled() {
+        let dir = TempDir::new("bin_on");
+        let file = dir.file_bytes("a.bin", b"hello\0world");
+        let mut opts = default_opts();
+        opts.search_binary = true;
+        let r = search_file(&file, &re("hello"), &opts).unwrap();
+        assert!(r.matched);
+        assert_eq!(r.match_count, 1);
+    }
+
+    #[test]
     fn non_utf8_file_supported() {
         let dir = TempDir::new("nonutf8");
-        let path = dir.0.join("a.txt");
-        let content: Vec<u8> = b"hello\n\xff\xfe\nworld\n".to_vec();
-        fs::write(&path, &content).unwrap();
+        let path = dir.file_bytes("a.txt", b"hello\n\xff\xfe\nworld\n");
 
         let r = search_file(&path, &re("world"), &default_opts()).unwrap();
         assert!(r.matched);
@@ -447,7 +507,6 @@ mod tests {
 
     #[test]
     fn only_matching_with_invert_falls_back() {
-        // -o 与 -v 同时给时，-v 优先，输出整行（不高亮）
         let dir = TempDir::new("om_inv");
         let file = dir.file("a.txt", "keep\ndrop\n");
         let mut opts = default_opts();
@@ -488,7 +547,91 @@ mod tests {
         opts.before = 1;
         opts.after = 1;
         let r = search_file(&file, &re("hit"), &opts).unwrap();
-        // 只输出第一次匹配及其前后上下文，after 上下文仍要输出完
         assert_eq!(output_lines(&r), vec!["C:l1", "M:hit", "C:l3"]);
+    }
+
+    #[test]
+    fn encoding_gbk_decodes() {
+        let dir = TempDir::new("gbk");
+        let (bytes, _, _) = encoding_rs::GBK.encode("你好\nhello\n");
+        let file = dir.file_bytes("a.txt", &bytes);
+
+        let mut opts = default_opts();
+        opts.encoding = Some(encoding_rs::GBK);
+        let r = search_file(&file, &re("你好"), &opts).unwrap();
+        assert!(r.matched);
+        assert_eq!(r.match_count, 1);
+
+        let r2 = search_file(&file, &re("hello"), &opts).unwrap();
+        assert!(r2.matched);
+    }
+
+    #[test]
+    fn encoding_utf8_is_streaming() {
+        let dir = TempDir::new("utf8_explicit");
+        let file = dir.file("a.txt", "hello\nworld\n");
+
+        let mut opts = default_opts();
+        opts.encoding = Some(encoding_rs::UTF_8);
+        let r = search_file(&file, &re("world"), &opts).unwrap();
+        assert!(r.matched);
+        assert_eq!(output_lines(&r), vec!["M:world"]);
+    }
+
+    #[test]
+    fn replace_substitutes_matches() {
+        let dir = TempDir::new("replace");
+        let file = dir.file("a.txt", "foo bar foo\n");
+        let mut opts = default_opts();
+        opts.replace = Some("X".to_string());
+        let r = search_file(&file, &re("foo"), &opts).unwrap();
+        assert!(r.matched);
+        assert_eq!(output_lines(&r), vec!["M:X bar X"]);
+    }
+
+    #[test]
+    fn replace_clears_matches() {
+        // 回归测试：替换后 matches 应为空，避免 printer 用旧区间切片越界
+        let dir = TempDir::new("replace_clear");
+        let file = dir.file("a.txt", "foo bar foo\n");
+        let mut opts = default_opts();
+        opts.replace = Some("X".to_string());
+        let r = search_file(&file, &re("foo"), &opts).unwrap();
+        match &r.output[0] {
+            OutputLine::Match { matches, .. } => assert!(matches.is_empty()),
+            _ => panic!("expected Match"),
+        }
+    }
+
+    #[test]
+    fn replace_with_capture_group() {
+        let dir = TempDir::new("replace_cap");
+        let file = dir.file("a.txt", "fn foo\n");
+        let mut opts = default_opts();
+        opts.replace = Some("[$1]".to_string());
+        let r = search_file(&file, &re(r"fn (\w+)"), &opts).unwrap();
+        assert_eq!(output_lines(&r), vec!["M:[foo]"]);
+    }
+
+    #[test]
+    fn replace_not_applied_when_invert() {
+        let dir = TempDir::new("replace_inv");
+        let file = dir.file("a.txt", "keep\ndrop\n");
+        let mut opts = default_opts();
+        opts.invert = true;
+        opts.replace = Some("X".to_string());
+        let r = search_file(&file, &re("drop"), &opts).unwrap();
+        assert_eq!(output_lines(&r), vec!["M:keep"]);
+    }
+
+    #[test]
+    fn replace_not_applied_in_only_matching() {
+        let dir = TempDir::new("replace_om");
+        let file = dir.file("a.txt", "foo bar foo\n");
+        let mut opts = default_opts();
+        opts.only_matching = true;
+        opts.replace = Some("X".to_string());
+        let r = search_file(&file, &re("foo"), &opts).unwrap();
+        assert_eq!(output_lines(&r), vec!["O:foo", "O:foo"]);
     }
 }

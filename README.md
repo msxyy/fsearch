@@ -27,10 +27,14 @@
 - 上下文：`-A` / `-B` / `-C`
 - 全词匹配 `-w`、反向匹配 `-v`、固定字符串 `-F`
 - 只输出匹配部分 `-o`
-- 按文件类型过滤 `--type rust`
+- 替换输出 `-r`
+- 按文件类型过滤 `--type`、排除类型 `--type-not`
 - 按文件名搜索 `--name`、只列文件 `--files`
 - 每文件上限 `-m N`、统计 `--stats`
-- JSON Lines 输出 `--json`
+- 排序输出 `--sort`
+- 编码支持 `--encoding`（GBK、Big5、Shift_JIS 等）
+- `-u` / `-uu` / `-uuu` 逐级放宽忽略规则
+- JSON Lines 输出 `--json`（含 begin/end/summary 事件）
 - 并行遍历（`ignore` 的并行 Walker）
 - 流式逐行搜索，内存与文件大小无关
 - 支持非 UTF-8，跳过二进制文件
@@ -102,8 +106,14 @@ fsearch -F "fn(" ./src
 # 只输出匹配部分
 fsearch -o "fn \w+" ./src
 
+# 替换匹配部分（不写回文件）
+fsearch -r "BAR" "foo" ./src
+
 # 只搜 Rust 文件
 fsearch --type rust "Result" .
+
+# 排除 Rust 文件
+fsearch --type-not rust -l "TODO" .
 
 # 只搜匹配 glob 的文件
 fsearch -g "*.toml" "version" .
@@ -120,8 +130,20 @@ fsearch -m 1 "fn " ./src
 # 输出统计信息
 fsearch --stats "Result" ./src
 
+# 排序输出（并行搜索，按路径排序打印）
+fsearch --sort -l "fn " .
+
 # 忽略 .gitignore
 fsearch --no-ignore -l "target" .
+
+# 忽略 .gitignore，且搜索隐藏文件
+fsearch -uu "target" .
+
+# 不读 .gitignore，搜隐藏文件，也搜二进制
+fsearch -uuu "fsearch" .
+
+# 搜 GBK 编码的文件
+fsearch --encoding gbk "中文" .
 
 # JSON Lines 输出
 fsearch --json "fn main" ./src
@@ -145,19 +167,33 @@ fsearch -i -n -C 1 --type rust "result" .
 | `-v` / `--invert` | 反向匹配，输出不含模式的行 |
 | `-F` / `--fixed` | 把模式当作固定字符串，不解释为正则 |
 | `-o` / `--only-matching` | 只输出匹配部分，而不是整行 |
+| `-r TEXT` / `--replace TEXT` | 把匹配部分替换成 TEXT，输出替换后的行（不写回文件） |
 | `-m N` / `--max-count N` | 每个文件最多输出 N 条匹配 |
 | `-g GLOB` / `--glob` | 只搜索匹配 glob 的文件 |
 | `--type TYPE` | 按文件类型过滤，可重复 |
+| `--type-not TYPE` | 排除指定文件类型，可重复 |
 | `--name` | 按文件名搜索，不搜索文件内容 |
 | `--files` | 只列出会被搜索的文件，不搜索内容 |
+| `--sort` | 并行搜索但输出按路径排序 |
 | `--json` | 以 JSON Lines 格式输出 |
 | `--stats` | 输出统计信息（扫描文件数、匹配数、耗时） |
+| `--encoding ENC` | 指定文件编码，如 gbk、big5、shift_jis |
 | `--no-ignore` | 不读取 `.gitignore` / `.ignore` |
+| `-u` / `-uu` / `-uuu` | 逐级放宽忽略规则 |
 | `--color MODE` | 颜色模式：`auto` / `always` / `never` |
 | `--follow` | 跟随符号链接 |
 | `--hidden` | 搜索隐藏文件 |
 | `-h` / `--help` | 显示帮助 |
 | `-V` / `--version` | 显示版本 |
+
+### `-u` / `-uu` / `-uuu` 的语义
+
+| 参数 | 效果 |
+|------|------|
+| （默认） | 读 `.gitignore`，跳过隐藏文件，跳过二进制 |
+| `-u` | 不读 `.gitignore` |
+| `-uu` | 不读 `.gitignore`，且搜索隐藏文件 |
+| `-uuu` | 不读 `.gitignore`，搜索隐藏文件和二进制文件 |
 
 ## 退出码
 
@@ -171,7 +207,7 @@ fsearch -i -n -C 1 --type rust "result" .
 
 ## 支持的文件类型
 
-`--type` 参数支持以下类型：
+`--type` / `--type-not` 参数支持以下类型：
 
 | 类型名 | 扩展名 |
 |--------|--------|
@@ -201,6 +237,14 @@ fsearch -i -n -C 1 --type rust "result" .
 | `kotlin` / `kt` | `.kt` `.kts` |
 | `scala` | `.scala` |
 | `haskell` / `hs` | `.hs` `.lhs` |
+
+## 支持的编码
+
+`--encoding` 参数接受 `encoding_rs` 支持的所有编码标签，常用：
+
+`utf-8`（默认，走流式）、`gbk`、`gb18030`、`big5`、`shift_jis`、`euc-jp`、`euc-kr`、`windows-1252`、`iso-8859-1` 等。
+
+指定非 UTF-8 编码时，整个文件会被解码到内存再搜索；默认 UTF-8 走流式，内存占用与文件大小无关。
 
 ## JSON 输出格式
 
@@ -264,10 +308,10 @@ benches/
 cargo test
 ```
 
-包含 **47 个测试**：
+包含 **71 个测试**：
 
-- 31 个单元测试：搜索逻辑、参数组装、JSON 转义
-- 16 个集成测试：调用真实 exe，验证端到端行为
+- 44 个单元测试：搜索逻辑、参数组装、JSON 转义
+- 27 个集成测试：调用真实 exe，验证端到端行为
 
 ## 代码质量
 
@@ -310,19 +354,20 @@ cargo bench
 - **流式处理**：逐行读取文件，内存占用与文件大小无关
 - **环形缓冲**：`-B` 上下文只保留最近 N 行，不会随文件增大
 - **非 UTF-8 安全**：非法字节用替代字符替换，不会中断搜索
-- **二进制检测**：读取前 8KB，遇到 `\0` 跳过
+- **二进制检测**：读取前 8KB，遇到 `\0` 跳过（`-uuu` 时也搜索）
 - **输出原子性**：每个文件的结果整体加锁打印，不会交错
 - **`-m` 与上下文**：达到 `-m` 上限后仍会输出当前匹配的 after 上下文，与 ripgrep 行为一致
+- **`--replace` 与高亮**：替换后清空匹配区间，避免字节偏移越界
 - **`.gitignore` 生效范围**：即使不在 git 仓库里，也会读取 `.gitignore`（通过 `require_git(false)`）
+- **`--sort` 模式**：并行搜索，收集结果后按路径排序，再串行打印
 
 ## 后续规划
 
-- [ ] `--type-not` 排除指定类型
-- [ ] `-u` / `-uu` / `-uuu` 逐级放宽忽略规则
-- [ ] `--sort path` 并行搜索但输出有序
-- [ ] `--encoding` 指定编码
 - [ ] `-e PATTERN` 支持多个模式
+- [ ] `--files-without-match` 反向文件列表
+- [ ] `--count-matches` 统计匹配次数（而非匹配行数）
 - [ ] Shell 自动补全
+- [ ] 增量索引模式
 
 ## 贡献
 

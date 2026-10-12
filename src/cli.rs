@@ -6,7 +6,11 @@ use clap::Parser;
 #[command(long_about = "在文件中搜索匹配的内容。\n\n\
 默认搜索文件内容。\n\
 --name  按文件名搜索。\n\
---files 只列出会被搜索的文件。")]
+--files 只列出会被搜索的文件。\n\n\
+-u / -uu / -uuu 逐级放宽忽略规则：\n\
+-u    不读 .gitignore\n\
+-uu   不读 .gitignore，且搜索隐藏文件\n\
+-uuu  不读 .gitignore，搜索隐藏文件和二进制文件")]
 pub struct Cli {
     /// 搜索模式；--files 模式下可省略
     pub pattern: Option<String>,
@@ -31,9 +35,25 @@ pub struct Cli {
     #[arg(long)]
     pub stats: bool,
 
+    /// 并行搜索但输出按路径排序（会先收集全部结果再打印）
+    #[arg(long)]
+    pub sort: bool,
+
+    /// 把匹配部分替换成指定文本，输出替换后的行（不写回文件）
+    #[arg(short = 'r', long = "replace", value_name = "TEXT")]
+    pub replace: Option<String>,
+
     /// 不读取 .gitignore / .ignore
     #[arg(long)]
     pub no_ignore: bool,
+
+    /// 逐级放宽忽略规则：-u 不读 .gitignore；-uu 还搜隐藏文件；-uuu 还搜二进制
+    #[arg(short = 'u', action = clap::ArgAction::Count)]
+    pub unrestricted: u8,
+
+    /// 指定文件编码，例如 gbk、gb18030、big5、shift_jis、euc-kr；默认 UTF-8
+    #[arg(long, value_name = "ENCODING")]
+    pub encoding: Option<String>,
 
     /// 忽略大小写
     #[arg(short = 'i', long)]
@@ -82,6 +102,10 @@ pub struct Cli {
     /// 按文件类型过滤，例如 --type rust，可重复
     #[arg(long = "type", value_name = "TYPE")]
     pub type_filter: Vec<String>,
+
+    /// 排除指定文件类型，例如 --type-not rust，可重复
+    #[arg(long = "type-not", value_name = "TYPE")]
+    pub type_not_filter: Vec<String>,
 
     /// 以 JSON Lines 格式输出
     #[arg(long)]

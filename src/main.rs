@@ -15,7 +15,7 @@ use std::process::ExitCode;
 
 use crate::cli::Cli;
 use crate::printer::{choose_color, JsonPrinter, Output, Printer};
-use crate::search::SearchOptions;
+use crate::search::{FileResult, SearchOptions};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -23,6 +23,9 @@ enum Mode {
     Name,
     Files,
 }
+
+/// 排序模式下收集的每个文件的搜索结果
+type CollectedResults = Arc<Mutex<Vec<(String, Option<FileResult>)>>>;
 
 fn main() -> ExitCode {
     match run() {
@@ -53,7 +56,7 @@ pub fn build_pattern(pattern: &str, fixed: bool, word: bool) -> String {
     p
 }
 
-/// 把 --type 映射到扩展名列表
+/// 把 --type / --type-not 映射到扩展名列表
 fn extensions_for_type(t: &str) -> Option<&'static [&'static str]> {
     Some(match t {
         "rust" | "rs" => &["rs"],
@@ -84,6 +87,26 @@ fn extensions_for_type(t: &str) -> Option<&'static [&'static str]> {
         "haskell" | "hs" => &["hs", "lhs"],
         _ => return None,
     })
+}
+
+/// 解析 --encoding 参数
+///
+/// 返回 None 表示使用默认 UTF-8 流式解码；
+/// 返回 Some(enc) 表示使用指定编码，整个文件会被解码到内存。
+fn parse_encoding(name: Option<&str>) -> Result<Option<&'static encoding_rs::Encoding>> {
+    let name = match name {
+        None => return Ok(None),
+        Some(n) => n,
+    };
+    match encoding_rs::Encoding::for_label(name.as_bytes()) {
+        // 显式指定 UTF-8 时也走流式，避免整体读入
+        Some(enc) if std::ptr::eq(enc, encoding_rs::UTF_8) => Ok(None),
+        Some(enc) => Ok(Some(enc)),
+        None => anyhow::bail!(
+            "未知编码: {}（可用：gbk, gb18030, big5, shift_jis, euc-kr, windows-1252 等）",
+            name
+        ),
+    }
 }
 
 fn run() -> Result<bool> {
@@ -131,14 +154,31 @@ fn run() -> Result<bool> {
     let before = cli.before.unwrap_or(cli.context);
     let after = cli.after.unwrap_or(cli.context);
 
+    // -u / -uu / -uuu 逐级放宽
+    let no_ignore = cli.no_ignore || cli.unrestricted >= 1;
+    let want_hidden = cli.hidden || cli.unrestricted >= 2;
+    let search_binary = cli.unrestricted >= 3;
+
+    // 解析编码
+    let encoding = parse_encoding(cli.encoding.as_deref())?;
+
+    let sort_output = cli.sort;
+    // 替换只对普通匹配输出生效；与 -l/-c/-o/--json 互斥时以后者优先
+    let replace: Option<Arc<String>> =
+        if cli.json || cli.files_with_matches || cli.count || cli.only_matching {
+            None
+        } else {
+            cli.replace.clone().map(Arc::new)
+        };
+
     // 遍历器
     let mut builder = WalkBuilder::new(&path);
     builder
-        .hidden(!cli.hidden)
+        .hidden(!want_hidden)
         .follow_links(cli.follow)
         // 即使不在 git 仓库里，也读取 .gitignore
         .require_git(false);
-    if cli.no_ignore {
+    if no_ignore {
         builder
             .ignore(false)
             .git_ignore(false)
@@ -146,8 +186,9 @@ fn run() -> Result<bool> {
             .git_exclude(false);
     }
 
-    // --glob 与 --type 通过 OverrideBuilder 白名单
-    let has_overrides = cli.glob.is_some() || !cli.type_filter.is_empty();
+    // --glob 与 --type / --type-not 通过 OverrideBuilder
+    let has_overrides =
+        cli.glob.is_some() || !cli.type_filter.is_empty() || !cli.type_not_filter.is_empty();
     if has_overrides {
         let mut ob = OverrideBuilder::new(&path);
         if let Some(glob) = &cli.glob {
@@ -164,6 +205,13 @@ fn run() -> Result<bool> {
                 ob.add(&format!("*.{}", ext))?;
             }
         }
+        for t in &cli.type_not_filter {
+            let exts =
+                extensions_for_type(t).ok_or_else(|| anyhow::anyhow!("未知的文件类型: {}", t))?;
+            for ext in exts {
+                ob.add(&format!("!*.{}", ext))?;
+            }
+        }
         builder.overrides(ob.build()?);
     }
 
@@ -173,12 +221,11 @@ fn run() -> Result<bool> {
     } else {
         choose_color(&cli.color)
     };
-    let output = if cli.json {
+    let mut output = if cli.json {
         Output::Json(JsonPrinter::new())
     } else {
         Output::Plain(Printer::new(color_choice, cli.line_number))
     };
-    let output = Arc::new(Mutex::new(output));
 
     // 共享统计
     let any_found = Arc::new(AtomicBool::new(false));
@@ -191,82 +238,162 @@ fn run() -> Result<bool> {
     let invert = cli.invert;
     let only_matching = cli.only_matching;
     let max_count = cli.max_count;
+    let name_mode = mode == Mode::Name;
+    let files_mode = mode == Mode::Files;
 
-    let walker = builder.build_parallel();
+    if sort_output {
+        // 并行搜索，结果收集后按路径排序，再串行打印
+        let collected: CollectedResults = Arc::new(Mutex::new(Vec::new()));
 
-    walker.run(|| {
-        let re = re.clone();
-        let output = Arc::clone(&output);
-        let any_found = Arc::clone(&any_found);
-        let files_scanned = Arc::clone(&files_scanned);
-        let files_matched = Arc::clone(&files_matched);
-        let total_matches = Arc::clone(&total_matches);
-
-        Box::new(move |result| {
-            let entry = match result {
-                Ok(e) => e,
-                Err(_) => return WalkState::Continue,
-            };
-
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                return WalkState::Continue;
-            }
-
-            files_scanned.fetch_add(1, Ordering::Relaxed);
-            let path = entry.path();
-            let path_str = path.display().to_string();
-
-            match mode {
-                Mode::Files => {
-                    any_found.store(true, Ordering::Relaxed);
-                    if let Ok(mut out) = output.lock() {
-                        let _ = out.print_filename_only(&path_str);
-                    }
+        let walker = builder.build_parallel();
+        walker.run(|| {
+            let re = re.clone();
+            let replace = replace.clone();
+            let collected = Arc::clone(&collected);
+            let files_scanned = Arc::clone(&files_scanned);
+            let any_found = Arc::clone(&any_found);
+            let files_matched = Arc::clone(&files_matched);
+            let total_matches = Arc::clone(&total_matches);
+            Box::new(move |result| {
+                let entry = match result {
+                    Ok(e) => e,
+                    Err(_) => return WalkState::Continue,
+                };
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    return WalkState::Continue;
                 }
-                Mode::Name => {
+                files_scanned.fetch_add(1, Ordering::Relaxed);
+                let path = entry.path();
+                let path_str = path.display().to_string();
+
+                if files_mode {
+                    any_found.store(true, Ordering::Relaxed);
+                    collected.lock().unwrap().push((path_str, None));
+                } else if name_mode {
                     if let Some(re) = &re {
                         let basename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
                         if re.is_match(basename) {
                             any_found.store(true, Ordering::Relaxed);
                             files_matched.fetch_add(1, Ordering::Relaxed);
-                            if let Ok(mut out) = output.lock() {
+                            collected.lock().unwrap().push((path_str, None));
+                        }
+                    }
+                } else if let Some(re) = &re {
+                    let opts = SearchOptions {
+                        files_with_matches,
+                        count,
+                        before,
+                        after,
+                        invert,
+                        only_matching,
+                        max_count,
+                        search_binary,
+                        encoding,
+                        replace: replace.as_ref().map(|s| (**s).clone()),
+                    };
+                    if let Ok(r) = search::search_file(path, re, &opts) {
+                        if r.matched {
+                            any_found.store(true, Ordering::Relaxed);
+                            files_matched.fetch_add(1, Ordering::Relaxed);
+                            total_matches.fetch_add(r.match_count, Ordering::Relaxed);
+                            collected.lock().unwrap().push((path_str, Some(r)));
+                        }
+                    }
+                }
+                WalkState::Continue
+            })
+        });
+
+        let mut list = Arc::try_unwrap(collected)
+            .map_err(|_| anyhow::anyhow!("内部错误：结果锁未释放"))?
+            .into_inner()
+            .unwrap();
+        list.sort_by(|a, b| a.0.cmp(&b.0));
+        for (path_str, fr) in list {
+            match fr {
+                None => {
+                    let _ = output.print_filename_only(&path_str);
+                }
+                Some(r) => {
+                    let _ = output.print_file_result(&r, files_with_matches, count);
+                }
+            }
+        }
+    } else {
+        // 并行搜索，边搜边打印
+        let shared = Arc::new(Mutex::new(output));
+
+        let walker = builder.build_parallel();
+        walker.run(|| {
+            let re = re.clone();
+            let replace = replace.clone();
+            let shared = Arc::clone(&shared);
+            let files_scanned = Arc::clone(&files_scanned);
+            let any_found = Arc::clone(&any_found);
+            let files_matched = Arc::clone(&files_matched);
+            let total_matches = Arc::clone(&total_matches);
+            Box::new(move |result| {
+                let entry = match result {
+                    Ok(e) => e,
+                    Err(_) => return WalkState::Continue,
+                };
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    return WalkState::Continue;
+                }
+                files_scanned.fetch_add(1, Ordering::Relaxed);
+                let path = entry.path();
+                let path_str = path.display().to_string();
+
+                if files_mode {
+                    any_found.store(true, Ordering::Relaxed);
+                    if let Ok(mut out) = shared.lock() {
+                        let _ = out.print_filename_only(&path_str);
+                    }
+                } else if name_mode {
+                    if let Some(re) = &re {
+                        let basename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                        if re.is_match(basename) {
+                            any_found.store(true, Ordering::Relaxed);
+                            files_matched.fetch_add(1, Ordering::Relaxed);
+                            if let Ok(mut out) = shared.lock() {
                                 let _ = out.print_filename_only(&path_str);
                             }
                         }
                     }
-                }
-                Mode::Content => {
-                    if let Some(re) = &re {
-                        let opts = SearchOptions {
-                            files_with_matches,
-                            count,
-                            before,
-                            after,
-                            invert,
-                            only_matching,
-                            max_count,
-                        };
-                        if let Ok(file_result) = search::search_file(path, re, &opts) {
-                            if file_result.matched {
-                                any_found.store(true, Ordering::Relaxed);
-                                files_matched.fetch_add(1, Ordering::Relaxed);
-                                total_matches.fetch_add(file_result.match_count, Ordering::Relaxed);
-                                if let Ok(mut out) = output.lock() {
-                                    let _ = out.print_file_result(
-                                        &file_result,
-                                        files_with_matches,
-                                        count,
-                                    );
-                                }
+                } else if let Some(re) = &re {
+                    let opts = SearchOptions {
+                        files_with_matches,
+                        count,
+                        before,
+                        after,
+                        invert,
+                        only_matching,
+                        max_count,
+                        search_binary,
+                        encoding,
+                        replace: replace.as_ref().map(|s| (**s).clone()),
+                    };
+                    if let Ok(r) = search::search_file(path, re, &opts) {
+                        if r.matched {
+                            any_found.store(true, Ordering::Relaxed);
+                            files_matched.fetch_add(1, Ordering::Relaxed);
+                            total_matches.fetch_add(r.match_count, Ordering::Relaxed);
+                            if let Ok(mut out) = shared.lock() {
+                                let _ = out.print_file_result(&r, files_with_matches, count);
                             }
                         }
                     }
                 }
-            }
+                WalkState::Continue
+            })
+        });
 
-            WalkState::Continue
-        })
-    });
+        // 所有 worker 结束后取回 Output
+        output = Arc::try_unwrap(shared)
+            .map_err(|_| anyhow::anyhow!("内部错误：输出锁未释放"))?
+            .into_inner()
+            .unwrap();
+    }
 
     let found = any_found.load(Ordering::Relaxed);
     let scanned = files_scanned.load(Ordering::Relaxed);
@@ -276,9 +403,7 @@ fn run() -> Result<bool> {
 
     if cli.stats {
         if cli.json {
-            if let Ok(mut out) = output.lock() {
-                let _ = out.print_summary(scanned, matched, m_count, elapsed.as_nanos());
-            }
+            let _ = output.print_summary(scanned, matched, m_count, elapsed.as_nanos());
         } else {
             eprintln!(
                 "fsearch: {} files scanned, {} files matched, {} matches, {:.2?}",
@@ -383,5 +508,35 @@ mod tests {
             Some(&["md", "markdown"][..])
         );
         assert!(extensions_for_type("unknown").is_none());
+    }
+
+    #[test]
+    fn encoding_none_returns_none() {
+        assert!(parse_encoding(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn encoding_utf8_label_returns_none() {
+        assert!(parse_encoding(Some("utf-8")).unwrap().is_none());
+        assert!(parse_encoding(Some("UTF-8")).unwrap().is_none());
+    }
+
+    #[test]
+    fn encoding_gbk_returns_some() {
+        let enc = parse_encoding(Some("gbk")).unwrap();
+        assert!(enc.is_some());
+        assert_eq!(enc.unwrap().name(), "GBK");
+    }
+
+    #[test]
+    fn encoding_big5_returns_some() {
+        let enc = parse_encoding(Some("big5")).unwrap();
+        assert!(enc.is_some());
+        assert_eq!(enc.unwrap().name(), "Big5");
+    }
+
+    #[test]
+    fn encoding_unknown_errors() {
+        assert!(parse_encoding(Some("not-a-real-encoding")).is_err());
     }
 }
