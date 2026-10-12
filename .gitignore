@@ -3,3 +3,6 @@
 *.log
 test.txt
 .fsearch-index
+fsearch.bash
+fsearch.ps1
+fsearch.1
