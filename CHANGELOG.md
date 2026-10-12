@@ -7,6 +7,13 @@
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-12
+
+### Fixed
+
+- 字节级预筛启用时行号错误：预筛跳过的行没有计入行号，
+  导致 `-n` 显示的是"匹配序号"而非真实行号
+
 ## [0.7.0] - 2026-10-12
 
 ### Added
@@ -145,7 +152,8 @@
 - 支持非 UTF-8，跳过二进制文件
 - 退出码：0 找到 / 1 未找到 / 2 出错
 
-[Unreleased]: https://github.com/msxyy/fsearch/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/msxyy/fsearch/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/msxyy/fsearch/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/msxyy/fsearch/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/msxyy/fsearch/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/msxyy/fsearch/compare/v0.5.0...v0.6.0

@@ -124,6 +124,9 @@ fn apply_replace(re: &Regex, line: &str, replacement: &str) -> String {
 ///
 /// Stream 分支支持**字节级预筛**：当不需要上下文时，先把行当成字节
 /// 交给预筛器，不命中的行直接跳过，省掉 UTF-8 解码。
+///
+/// 两种变体都自带 `line_no` 计数，`next_line` 返回真实行号，
+/// 保证预筛跳过的行也计入行号。
 enum LineSource {
     Stream {
         reader: BufReader<File>,
@@ -131,18 +134,25 @@ enum LineSource {
         prefilter: Option<Arc<Prefilter>>,
         /// 是否跳过预筛（有上下文时不能跳过，因为上下文行要原样输出）
         skip_prefilter: bool,
+        /// 文件里的真实行号（每读一行 +1，不管是否被预筛跳过）
+        line_no: usize,
     },
-    Memory(std::vec::IntoIter<String>),
+    Memory {
+        lines: std::vec::IntoIter<String>,
+        line_no: usize,
+    },
 }
 
 impl LineSource {
-    fn next_line(&mut self) -> Option<String> {
+    /// 返回 `(真实行号, 行内容)`；到文件结尾返回 `None`
+    fn next_line(&mut self) -> Option<(usize, String)> {
         match self {
             LineSource::Stream {
                 reader,
                 buf,
                 prefilter,
                 skip_prefilter,
+                line_no,
             } => loop {
                 buf.clear();
                 let n = match reader.read_until(b'\n', buf) {
@@ -150,6 +160,9 @@ impl LineSource {
                     Ok(n) => n,
                     Err(_) => return None,
                 };
+                // 每读一行，行号 +1，即使这行会被预筛跳过
+                *line_no += 1;
+
                 let mut end = n;
                 if end > 0 && buf[end - 1] == b'\n' {
                     end -= 1;
@@ -167,9 +180,13 @@ impl LineSource {
                     }
                 }
 
-                return Some(String::from_utf8_lossy(&buf[..end]).into_owned());
+                return Some((*line_no, String::from_utf8_lossy(&buf[..end]).into_owned()));
             },
-            LineSource::Memory(it) => it.next(),
+            LineSource::Memory { lines, line_no } => {
+                let line = lines.next()?;
+                *line_no += 1;
+                Some((*line_no, line))
+            }
         }
     }
 }
@@ -209,7 +226,10 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
             };
             let (cow, _, _) = enc.decode(&bytes);
             let lines: Vec<String> = cow.lines().map(String::from).collect();
-            LineSource::Memory(lines.into_iter())
+            LineSource::Memory {
+                lines: lines.into_iter(),
+                line_no: 0,
+            }
         }
         _ => {
             let file = match File::open(path) {
@@ -226,6 +246,7 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
                 buf: Vec::new(),
                 prefilter: opts.prefilter.clone(),
                 skip_prefilter,
+                line_no: 0,
             }
         }
     };
@@ -238,12 +259,9 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
     let mut ring: VecDeque<(usize, String)> = VecDeque::new();
     let mut after_remaining: usize = 0;
     let mut last_printed: Option<usize> = None;
-    let mut line_no: usize = 0;
     let mut hit_limit = false;
 
-    while let Some(line) = source.next_line() {
-        line_no += 1;
-
+    while let Some((line_no, line)) = source.next_line() {
         if hit_limit {
             if build_output && after_remaining > 0 {
                 result.output.push(OutputLine::Context {
@@ -776,7 +794,7 @@ mod tests {
         assert_eq!(r.match_count, 1);
     }
 
-    // ---------- 字节级预筛（v0.8.0） ----------
+    // ---------- 字节级预筛 ----------
 
     #[test]
     fn prefilter_bytes_matches() {
@@ -788,9 +806,7 @@ mod tests {
     #[test]
     fn prefilter_bytes_works_with_non_utf8() {
         let pf = Prefilter::new(&["needle".to_string()], false).unwrap();
-        // 含非法 UTF-8 字节，但 needle 在
         assert!(pf.might_match_bytes(b"\xff\xfeneedle\xff"));
-        // 不含 needle
         assert!(!pf.might_match_bytes(b"\xff\xfe\xff"));
     }
 
@@ -801,7 +817,6 @@ mod tests {
         let pf = Arc::new(Prefilter::new(&["needle".to_string()], false).unwrap());
         let mut opts = default_opts();
         opts.prefilter = Some(pf);
-        // 无上下文：字节级预筛生效
         let r = search_file(&file, &re("needle"), &opts).unwrap();
         assert_eq!(r.match_count, 1);
         assert_eq!(output_lines(&r), vec!["M:needle"]);
@@ -816,7 +831,6 @@ mod tests {
         opts.prefilter = Some(pf);
         opts.before = 1;
         opts.after = 1;
-        // 有上下文：字节级预筛被跳过，但字符串级预筛仍生效
         let r = search_file(&file, &re("needle"), &opts).unwrap();
         assert_eq!(output_lines(&r), vec!["C:l1", "M:needle", "C:l3"]);
     }
@@ -824,12 +838,55 @@ mod tests {
     #[test]
     fn byte_prefilter_non_utf8_with_context() {
         let dir = TempDir::new("byte_pf_nonutf8");
-        // 含非法 UTF-8 字节，且没有 needle
         let path = dir.file_bytes("a.txt", b"line1\n\xff\xfe\nline3\n");
         let pf = Arc::new(Prefilter::new(&["needle".to_string()], false).unwrap());
         let mut opts = default_opts();
         opts.prefilter = Some(pf);
         let r = search_file(&path, &re("xyz"), &opts).unwrap();
         assert!(!r.matched);
+    }
+
+    // ---------- 行号正确性（v0.7.0 修复） ----------
+
+    #[test]
+    fn line_number_correct_with_prefilter() {
+        let dir = TempDir::new("line_no_pf");
+        let mut content = String::new();
+        for _ in 0..10 {
+            content.push_str("filler line\n");
+        }
+        content.push_str("has needle here\n");
+        content.push_str("more filler\n");
+        let file = dir.file("a.txt", &content);
+
+        let pf = Arc::new(Prefilter::new(&["needle".to_string()], false).unwrap());
+        let mut opts = default_opts();
+        opts.prefilter = Some(pf);
+
+        let r = search_file(&file, &re("needle"), &opts).unwrap();
+        assert_eq!(r.match_count, 1);
+        match &r.output[0] {
+            OutputLine::Match { line_no, .. } => {
+                assert_eq!(*line_no, 11, "预筛跳过的行也必须计入行号");
+            }
+            _ => panic!("期望 Match 行"),
+        }
+    }
+
+    #[test]
+    fn line_number_correct_without_prefilter() {
+        let dir = TempDir::new("line_no_nopf");
+        let mut content = String::new();
+        for _ in 0..10 {
+            content.push_str("filler line\n");
+        }
+        content.push_str("has needle here\n");
+        let file = dir.file("a.txt", &content);
+
+        let r = search_file(&file, &re("needle"), &default_opts()).unwrap();
+        match &r.output[0] {
+            OutputLine::Match { line_no, .. } => assert_eq!(*line_no, 11),
+            _ => panic!("期望 Match 行"),
+        }
     }
 }
