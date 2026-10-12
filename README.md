@@ -39,13 +39,16 @@
 - `-u` / `-uu` / `-uuu` 逐级放宽忽略规则
 - 递归深度 `--max-depth`、文件大小 `--max-filesize`
 - 静默模式 `-q`
+- 输出控制：`--column`、`--vimgrep`、`--no-filename`、`-0`、`--heading`
 - 增量索引 `--build-index` / `--use-index`，支持增量更新
-- 配置文件 `.fsearch.toml`
+- 索引持久化到用户缓存目录，不污染项目
+- 配置文件 `.fsearch.toml`，支持 `--no-config` 忽略
 - JSON Lines 输出 `--json`（含 begin/end/summary 事件）
 - Shell 补全生成 `--generate-completions`
 - Man 手册生成 `--generate-man`
 - 并行遍历（`ignore` 的并行 Walker）
 - 流式逐行搜索，内存与文件大小无关
+- 字节级预筛：无上下文时直接跳过不含字面量的行，不解码
 - 支持非 UTF-8，跳过二进制文件
 - 彩色高亮、正确的退出码（0/1/2）
 
@@ -103,6 +106,8 @@ println!("{} 命中 {} 行", result.path, result.match_count);
 2. 没有 → 用当前工作目录的 `.fsearch.toml`
 3. 都没有 → 空配置
 
+用 `--no-config` 可以显式忽略配置文件。
+
 ```toml
 # .fsearch.toml
 ignore_case = true
@@ -121,6 +126,8 @@ color = "always"
 |------|------|----------|
 | `ignore_case` | bool | `-i` |
 | `line_number` | bool | `-n` |
+| `column` | bool | `--column` |
+| `vimgrep` | bool | `--vimgrep` |
 | `hidden` | bool | `--hidden` |
 | `follow` | bool | `--follow` |
 | `word` | bool | `-w` |
@@ -132,6 +139,11 @@ color = "always"
 | `sort` | bool | `--sort` |
 | `stats` | bool | `--stats` |
 | `json` | bool | `--json` |
+| `no_filename` | bool | `--no-filename` |
+| `with_filename` | bool | `--with-filename` |
+| `null_separator` | bool | `-0` |
+| `heading` | bool | `--heading` |
+| `no_heading` | bool | `--no-heading` |
 | `context` | int | `-C N` |
 | `before` | int | `-B N` |
 | `after` | int | `-A N` |
@@ -161,7 +173,20 @@ fsearch --use-index "fn main" ./src
 fsearch --use-index "Result" ./src
 ```
 
-索引文件保存在目标目录下的 `.fsearch-index`，包含：
+### 索引存到哪里
+
+索引文件持久化到**用户缓存目录**，不污染项目：
+
+| 平台 | 路径 |
+|------|------|
+| Windows | `%LOCALAPPDATA%\fsearch\cache\<hash>.fsearch-index` |
+| macOS | `~/Library/Caches/fsearch/cache/<hash>.fsearch-index` |
+| Linux | `$XDG_CACHE_HOME/fsearch/cache/<hash>.fsearch-index` 或 `~/.cache/fsearch/cache/<hash>.fsearch-index` |
+
+`<hash>` 是目录规范化路径的哈希，同一目录多次调用自动复用同一个索引。
+如果缓存目录不可用（比如权限不足），会回退到项目目录的 `.fsearch-index`。
+
+### 索引内容
 
 - 所有非二进制文件的路径、大小、修改时间
 - 每个文件的 3-gram（三字节序列）列表
@@ -169,14 +194,27 @@ fsearch --use-index "Result" ./src
 
 搜索时把 pattern 拆成 3-gram，取交集得到候选文件，只在候选文件里做精确正则搜索。
 
-**自动更新**：`--use-index` 会检查每个文件的 size 和 mtime，以及目录下是否有新文件。
-索引过期或不存在时会**增量更新**——只重建变化的文件，未变化的文件直接复用旧索引，输出：
+### 自动更新
+
+`--use-index` 会检查每个文件的 size 和 mtime，以及目录下是否有新文件。
+索引过期或不存在时会**增量更新**——只重建变化的文件，未变化的文件直接复用旧索引：
 
 ```
 fsearch: 索引更新完成（复用 100 个，重建 3 个）
 ```
 
 只支持**长度 ≥ 3 的字面量 pattern**；含正则元字符时自动回退到全量扫描。
+
+### 性能提示
+
+**中小项目全量扫描已经够快**。索引的价值在于：
+
+- 项目文件很多（几万到几十万）
+- 反复搜索同一批目录
+- pattern 是字面量
+- 文件变化不频繁
+
+这种场景下，用索引能比全量扫描快 10–50 倍。
 
 ## Shell 补全与 man 手册
 
@@ -296,6 +334,24 @@ fsearch --build-index ./src
 # 使用索引加速搜索（索引会自动检测过期并增量更新）
 fsearch --use-index "fn main" ./src
 
+# 忽略配置文件
+fsearch --no-config "fn main" ./src
+
+# 显示列号
+fsearch --column "fn " ./src
+
+# vimgrep 格式：file:line:col:content
+fsearch --vimgrep "fn main" ./src
+
+# 不显示文件名
+fsearch --no-filename "fn main" ./src
+
+# 路径之间用 NUL 分隔（配合 xargs -0）
+fsearch -l -0 "TODO" . | xargs -0 wc -l
+
+# 按文件分组输出
+fsearch --heading "fn " ./src
+
 # JSON Lines 输出
 fsearch --json "fn main" ./src
 ```
@@ -306,6 +362,8 @@ fsearch --json "fn main" ./src
 |------|------|
 | `-i` / `--ignore-case` | 忽略大小写 |
 | `-n` / `--line-number` | 显示行号 |
+| `--column` | 显示每个匹配的 1-based 列号 |
+| `--vimgrep` | 输出 `file:line:col:content`，同一行的多个匹配各占一行 |
 | `-l` / `--files-with-matches` | 只输出匹配到的文件名 |
 | `-c` / `--count` | 只输出匹配行数 |
 | `-C N` / `--context N` | 匹配行前后各 N 行上下文 |
@@ -326,8 +384,12 @@ fsearch --json "fn main" ./src
 | `--files-without-match` | 列出不含匹配的文件（`-l` 的反向） |
 | `--count-matches` | 统计匹配次数（每次出现都算一次）；隐含 `-c` |
 | `--sort` | 并行搜索但输出按路径排序 |
-| `--build-index DIR` | 为目录建立内容索引，保存到 `<DIR>/.fsearch-index` |
+| `--no-filename` / `--with-filename` | 控制是否显示文件名 |
+| `-0` / `--null` | 路径之间用 NUL 字节分隔 |
+| `--heading` / `--no-heading` | 按文件分组输出，文件名单独一行 |
+| `--build-index DIR` | 为目录建立内容索引，保存到用户缓存目录 |
 | `--use-index` | 使用已有索引加速搜索（仅支持长度 ≥ 3 的字面量） |
+| `--no-config` | 忽略 `.fsearch.toml` 配置文件 |
 | `--json` | 以 JSON Lines 格式输出 |
 | `--stats` | 输出统计信息（扫描文件数、匹配数、耗时） |
 | `--encoding ENC` | 指定文件编码，如 gbk、big5、shift_jis |
@@ -408,8 +470,9 @@ fsearch --json "fn main" ./src
 
 对 `-F` 或纯字面量 pattern，`fsearch` 会自动启用字面量预筛：
 
-- 用 `aho-corasick` 在每一行上快速检查字面量是否存在
-- 不可能命中的行直接跳过，不跑正则
+- 无上下文（`-A`/`-B` 都为 0）时，预筛直接在 `&[u8]` 上跑，
+  不命中的行跳过 UTF-8 解码
+- 有上下文时，退回到字符串级预筛（上下文行必须原样输出）
 - 可能命中的行仍会跑一次正则，保证语义正确
 
 预筛在以下情况自动关闭：
@@ -466,8 +529,8 @@ src/
 ├── config.rs   # .fsearch.toml 配置文件解析
 ├── pattern.rs  # 正则模式构建、字面量识别
 ├── search.rs   # 单文件流式搜索、字面量预筛
-├── printer.rs  # 输出（普通 / JSON / 静默）
-└── index.rs    # 增量索引（3-gram 倒排表、增量更新）
+├── printer.rs  # 输出（普通 / JSON / 静默 / vimgrep / heading）
+└── index.rs    # 增量索引（3-gram 倒排表、增量更新、缓存持久化）
 
 tests/
 └── cli.rs      # 集成测试
@@ -482,10 +545,10 @@ benches/
 cargo test
 ```
 
-包含 **129 个测试**：
+包含 **150 个测试**：
 
-- 79 个库单元测试：搜索、参数组装、JSON 转义、多模式合并、索引、字面量预筛、配置解析
-- 49 个集成测试：调用真实 exe，验证端到端行为
+- 89 个库单元测试：搜索、参数组装、JSON 转义、多模式合并、索引、字面量预筛、配置解析
+- 60 个集成测试：调用真实 exe，验证端到端行为
 - 1 个 doc-test
 
 ## 代码质量
@@ -517,8 +580,11 @@ hyperfine --warmup 3 \
 
 `fsearch` 有两条加速路径：
 
-- **一次性搜索**：字面量预筛自动启用，用 `aho-corasick` 跳过不可能命中的行
+- **一次性搜索**：字面量预筛自动启用；无上下文时直接在字节层面跳过不含字面量的行
 - **反复搜索同一目录**：`--build-index` 建索引，之后 `--use-index` 只扫候选文件，索引变化时增量更新
+
+**中小项目**里 `rg` 和 VS Code 自带搜索更快（它们用 `memchr`、`mmap`、SIMD 等底层优化）。
+**大型项目 + 重复搜索**里，`fsearch` 的索引能带来 10–50 倍的加速。
 
 项目内自带简易 benchmark：
 
@@ -540,15 +606,19 @@ cargo bench
 - **`--sort` 模式**：并行搜索，收集结果后按路径排序，再串行打印
 - **`-e` 与位置参数**：有 `-e` 时，位置参数被当作路径
 - **增量索引**：3-gram 倒排表 + 每文件 trigram 列表；更新时只重建变化文件
-- **字面量预筛**：`aho-corasick` 快速排除不可能命中的行，命中后仍跑 regex 保证语义
+- **索引持久化**：索引按目录路径哈希存到用户缓存目录，多次调用自动复用
+- **字面量预筛**：`aho-corasick` 快速排除不可能命中的行；无上下文时字节级预筛
+- **vimgrep / heading / column**：`Printer` 用构建器模式装配输出选项
 - **库 + 二进制**：核心逻辑在 `lib.rs`，CLI 只是薄薄一层
-- **配置文件**：`.fsearch.toml` 提供目录级默认选项，命令行参数始终优先
+- **配置文件**：`.fsearch.toml` 提供目录级默认选项，命令行参数始终优先；
+  `--no-config` 可显式忽略
 
 ## 后续规划
 
 - [ ] Windows 原生打包（Inno Setup / WiX）
 - [ ] Scoop / winget 分发
-- [ ] 索引持久化到用户目录（而非项目目录）
+- [ ] 大文件内存映射（`memmap2`）
+- [ ] `bstr` 替代 `from_utf8_lossy`，全字节级搜索
 
 ## 贡献
 

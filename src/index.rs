@@ -23,6 +23,21 @@ pub struct Index {
     trigrams: HashMap<[u8; 3], Vec<u32>>,
 }
 
+/// pattern 是否可以被索引加速
+///
+/// 要求：全是字面量（不含正则元字符），长度 ≥ 3 字节。
+pub fn is_indexable(pattern: &str) -> bool {
+    if pattern.chars().any(|c| {
+        matches!(
+            c,
+            '\\' | '.' | '*' | '+' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '|' | '^' | '$'
+        )
+    }) {
+        return false;
+    }
+    pattern.len() >= 3
+}
+
 /// 从文件内容提取所有 3-gram（转小写后按字节切）
 fn extract_trigrams(content: &[u8]) -> Vec<[u8; 3]> {
     if content.len() < 3 {
@@ -49,6 +64,74 @@ fn rebuild_inverted(files: &[FileEntry]) -> HashMap<[u8; 3], Vec<u32>> {
         ids.dedup();
     }
     trigrams
+}
+
+/// 平台缓存目录的基路径
+#[cfg(target_os = "windows")]
+fn cache_base() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+}
+
+#[cfg(target_os = "macos")]
+fn cache_base() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|p| PathBuf::from(p).join("Library").join("Caches"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn cache_base() -> Option<PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".cache")))
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn cache_base() -> Option<PathBuf> {
+    None
+}
+
+/// fsearch 的用户缓存目录
+///
+/// - Windows：`%LOCALAPPDATA%\fsearch\cache`
+/// - macOS：`~/Library/Caches/fsearch/cache`
+/// - Linux：`$XDG_CACHE_HOME/fsearch/cache` 或 `~/.cache/fsearch/cache`
+fn cache_dir() -> Option<PathBuf> {
+    cache_base().map(|b| b.join("fsearch").join("cache"))
+}
+
+/// 用 DefaultHasher 对规范化路径做哈希
+fn hash_path(p: &Path) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let abs = p
+        .canonicalize()
+        .ok()
+        .or_else(|| std::env::current_dir().ok().map(|cwd| cwd.join(p)))
+        .unwrap_or_else(|| p.to_path_buf());
+
+    let mut hasher = DefaultHasher::new();
+    abs.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 索引文件的默认存储位置
+///
+/// 优先放到用户缓存目录；缓存目录不可用时回退到 `<root>/.fsearch-index`。
+pub fn index_path(root: &Path) -> PathBuf {
+    if let Some(cache) = cache_dir() {
+        let h = hash_path(root);
+        return cache.join(format!("{:016x}.fsearch-index", h));
+    }
+    root.join(".fsearch-index")
+}
+
+/// 确保索引文件的父目录存在
+fn ensure_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    Ok(())
 }
 
 impl Index {
@@ -103,10 +186,7 @@ impl Index {
     }
 
     /// 增量更新：复用旧索引里未变化文件的 trigram，只重新读变化的文件
-    ///
-    /// `old` 是之前的索引；为 `None` 时等价于全量构建。
     pub fn update(root: &Path, old: Option<&Index>) -> Result<Self> {
-        // 旧索引按路径索引
         let old_by_path: HashMap<&str, &FileEntry> = match old {
             Some(idx) => idx.files.iter().map(|f| (f.path.as_str(), f)).collect(),
             None => HashMap::new(),
@@ -143,7 +223,7 @@ impl Index {
 
             let path_str = path.display().to_string();
 
-            // 未变化 → 复用旧条目（含 trigrams）
+            // 未变化 → 复用旧条目
             if let Some(old_entry) = old_by_path.get(path_str.as_str()) {
                 if old_entry.size == size && old_entry.mtime == mtime {
                     files.push((*old_entry).clone());
@@ -152,7 +232,7 @@ impl Index {
                 }
             }
 
-            // 新文件或已变化 → 重新读取内容
+            // 新文件或已变化 → 重新读取
             let content = match fs::read(path) {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -180,6 +260,7 @@ impl Index {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
+        ensure_parent(path)?;
         let file = fs::File::create(path)?;
         let mut w = BufWriter::new(file);
 
@@ -187,7 +268,6 @@ impl Index {
         w.write_all(&(self.files.len() as u32).to_le_bytes())?;
         w.write_all(&(self.trigrams.len() as u32).to_le_bytes())?;
 
-        // 文件区：路径、大小、mtime、该文件的 trigram 列表
         for f in &self.files {
             let pb = f.path.as_bytes();
             w.write_all(&(pb.len() as u32).to_le_bytes())?;
@@ -200,7 +280,6 @@ impl Index {
             }
         }
 
-        // 倒排表区
         for (tri, ids) in &self.trigrams {
             w.write_all(tri)?;
             w.write_all(&(ids.len() as u32).to_le_bytes())?;
@@ -277,7 +356,7 @@ impl Index {
         Ok(Index { files, trigrams })
     }
 
-    /// 索引是否已过期（任何文件 size/mtime 变了，或有新文件/删除文件）
+    /// 索引是否已过期
     pub fn is_stale(&self, root: &Path) -> bool {
         for f in &self.files {
             let p = Path::new(&f.path);
@@ -320,14 +399,9 @@ impl Index {
         false
     }
 
-    /// 如果 pattern 全是字面量，返回候选文件路径；否则返回 None
+    /// 如果 pattern 全是字面量且长度 ≥ 3，返回候选文件路径；否则返回 None
     pub fn candidates(&self, pattern: &str) -> Option<Vec<String>> {
-        if pattern.chars().any(|c| {
-            matches!(
-                c,
-                '\\' | '.' | '*' | '+' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '|' | '^' | '$'
-            )
-        }) {
+        if !is_indexable(pattern) {
             return None;
         }
 
@@ -336,10 +410,6 @@ impl Index {
             .iter()
             .map(|b| b.to_ascii_lowercase())
             .collect();
-
-        if lower.len() < 3 {
-            return None;
-        }
 
         let mut candidate_sets: Vec<&Vec<u32>> = Vec::new();
         for i in 0..=lower.len() - 3 {
@@ -376,11 +446,6 @@ impl Index {
     }
 }
 
-/// 索引文件的默认存储位置
-pub fn index_path(root: &Path) -> PathBuf {
-    root.join(".fsearch-index")
-}
-
 /// 建立索引并保存，返回索引的文件数
 pub fn build_and_save(root: &Path) -> Result<usize> {
     let index = Index::build(root)?;
@@ -394,17 +459,13 @@ pub fn build_and_save(root: &Path) -> Result<usize> {
 /// 返回 `(index, updated)`：
 /// - `updated = true` 表示索引被创建或更新过
 /// - `updated = false` 表示磁盘上的索引仍然新鲜，直接返回
-///
-/// 若磁盘上没有索引，或索引是老格式（FSIDX001），会走全量构建。
 pub fn load_or_update(root: &Path) -> Result<(Index, bool)> {
     let idx_path = index_path(root);
 
-    // 尝试加载旧索引
     let old = if idx_path.exists() {
         match Index::load(&idx_path) {
             Ok(idx) => Some(idx),
             Err(_) => {
-                // 格式不对或损坏，删掉走全量
                 let _ = fs::remove_file(&idx_path);
                 None
             }
@@ -413,14 +474,12 @@ pub fn load_or_update(root: &Path) -> Result<(Index, bool)> {
         None
     };
 
-    // 有旧索引且新鲜 → 直接用
     if let Some(ref idx) = old {
         if !idx.is_stale(root) {
             return Ok((old.unwrap(), false));
         }
     }
 
-    // 增量更新（old 为 None 时全量）
     let new_idx = Index::update(root, old.as_ref())?;
     new_idx.save(&idx_path)?;
     Ok((new_idx, true))
@@ -456,6 +515,8 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std_fs::remove_dir_all(&self.0);
+            let idx = index_path(&self.0);
+            let _ = std_fs::remove_file(&idx);
         }
     }
 
@@ -511,6 +572,16 @@ mod tests {
 
         let index = Index::build(&dir.0).unwrap();
         assert!(index.candidates("hi").is_none());
+    }
+
+    #[test]
+    fn is_indexable_check() {
+        assert!(is_indexable("hello"));
+        assert!(is_indexable("fn main"));
+        assert!(!is_indexable("hi"));
+        assert!(!is_indexable("a.c"));
+        assert!(!is_indexable("fn("));
+        assert!(!is_indexable("^hello"));
     }
 
     #[test]
@@ -615,8 +686,6 @@ mod tests {
         assert_eq!(idx.file_count(), 2);
     }
 
-    // ---------- 增量更新专项 ----------
-
     #[test]
     fn update_reuses_unchanged_trigrams() {
         let dir = TempDir::new("up_reuse");
@@ -624,7 +693,6 @@ mod tests {
         dir.file("b.txt", "foo bar\n");
 
         let idx1 = Index::build(&dir.0).unwrap();
-        // 没变过，update 后内容应完全一致
         let idx2 = Index::update(&dir.0, Some(&idx1)).unwrap();
         assert_eq!(idx2.file_count(), 2);
         assert_eq!(idx2.candidates("hello").unwrap().len(), 1);
@@ -690,16 +758,23 @@ mod tests {
     #[test]
     fn old_format_magic_is_rejected() {
         let dir = TempDir::new("old_magic");
-        // 写一个 FSIDX001 的假文件
-        let p = dir.0.join(".fsearch-index");
-        std_fs::write(&p, b"FSIDX001this is old format").unwrap();
+        let idx_path = index_path(&dir.0);
+        ensure_parent(&idx_path).unwrap();
+        std_fs::write(&idx_path, b"FSIDX001this is old format").unwrap();
 
-        let result = Index::load(&p);
+        let result = Index::load(&idx_path);
         assert!(result.is_err());
 
-        // load_or_update 应该丢弃旧索引并重建
         let (idx, updated) = load_or_update(&dir.0).unwrap();
         assert!(updated);
         assert_eq!(idx.file_count(), 0);
+    }
+
+    #[test]
+    fn index_path_uses_cache_or_project() {
+        let dir = TempDir::new("path_check");
+        let p = index_path(&dir.0);
+        assert!(p.to_str().is_some());
+        assert!(p.file_name().is_some());
     }
 }

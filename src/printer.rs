@@ -77,6 +77,12 @@ pub struct Printer {
     stdout: StandardStream,
     show_line_number: bool,
     show_filename: bool,
+    show_column: bool,
+    vimgrep: bool,
+    heading: bool,
+    null_separator: bool,
+    /// 上一个打印的文件路径（heading 模式用来判断是否需要重新打印文件名）
+    last_heading: Option<String>,
 }
 
 impl Printer {
@@ -85,7 +91,41 @@ impl Printer {
             stdout: StandardStream::stdout(choice),
             show_line_number,
             show_filename: true,
+            show_column: false,
+            vimgrep: false,
+            heading: false,
+            null_separator: false,
+            last_heading: None,
         }
+    }
+
+    pub fn with_filename(mut self, v: bool) -> Self {
+        self.show_filename = v;
+        self
+    }
+
+    pub fn with_column(mut self, v: bool) -> Self {
+        self.show_column = v;
+        self
+    }
+
+    pub fn with_vimgrep(mut self, v: bool) -> Self {
+        self.vimgrep = v;
+        // vimgrep 隐含显示列号
+        if v {
+            self.show_column = true;
+        }
+        self
+    }
+
+    pub fn with_heading(mut self, v: bool) -> Self {
+        self.heading = v;
+        self
+    }
+
+    pub fn with_null_separator(mut self, v: bool) -> Self {
+        self.null_separator = v;
+        self
     }
 
     pub fn print_file_result(
@@ -107,6 +147,40 @@ impl Printer {
             return self.print_count(&result.path, n);
         }
 
+        // vimgrep 模式：每个匹配单独一行 file:line:col:content
+        if self.vimgrep {
+            return self.print_vimgrep(result);
+        }
+
+        // heading 模式：文件名单独一行，匹配行不带文件名
+        if self.heading {
+            let saved = self.show_filename;
+            self.show_filename = false;
+            let mut printed_heading = false;
+            for line in &result.output {
+                if matches!(
+                    line,
+                    OutputLine::Match { .. } | OutputLine::MatchOnly { .. }
+                ) && !printed_heading
+                {
+                    self.print_heading(&result.path)?;
+                    printed_heading = true;
+                }
+                self.print_one_line(&result.path, line)?;
+            }
+            self.show_filename = saved;
+            return Ok(());
+        }
+
+        // 默认模式
+        for line in &result.output {
+            self.print_one_line(&result.path, line)?;
+        }
+        Ok(())
+    }
+
+    /// vimgrep 输出：对每个匹配都输出 file:line:col:content
+    fn print_vimgrep(&mut self, result: &FileResult) -> Result<()> {
         for line in &result.output {
             match line {
                 OutputLine::Match {
@@ -114,27 +188,98 @@ impl Printer {
                     line,
                     matches,
                 } => {
-                    self.print_match(&result.path, *line_no, line, matches)?;
+                    if matches.is_empty() {
+                        // 无高亮信息（如 -v 或 -r），只输出一次
+                        self.print_vimgrep_prefix(&result.path, *line_no, 1)?;
+                        writeln!(self.stdout, "{}", line)?;
+                    } else {
+                        for &(start, _end) in matches {
+                            self.print_vimgrep_prefix(&result.path, *line_no, start + 1)?;
+                            writeln!(self.stdout, "{}", line)?;
+                        }
+                    }
                 }
                 OutputLine::MatchOnly { line_no, text } => {
-                    self.print_match_only(&result.path, *line_no, text)?;
+                    self.print_vimgrep_prefix(&result.path, *line_no, 1)?;
+                    writeln!(self.stdout, "{}", text)?;
                 }
-                OutputLine::Context { line_no, line } => {
-                    self.print_context(&result.path, *line_no, line, false)?;
-                }
-                OutputLine::Separator => {
-                    self.print_context("", 0, "", true)?;
+                OutputLine::Context { .. } | OutputLine::Separator => {
+                    // vimgrep 模式忽略上下文和分隔符
                 }
             }
         }
         Ok(())
     }
 
-    /// 对外公开的文件名输出
-    pub fn print_filename_pub(&mut self, path: &str) -> Result<()> {
+    fn print_vimgrep_prefix(&mut self, path: &str, line_no: usize, col: usize) -> Result<()> {
+        if self.show_filename {
+            self.stdout
+                .set_color(ColorSpec::new().set_fg(Some(Color::Magenta)).set_bold(true))?;
+            write!(self.stdout, "{}", path)?;
+            self.stdout
+                .set_color(ColorSpec::new().set_fg(Some(Color::Cyan)))?;
+            write!(self.stdout, ":")?;
+            self.stdout.reset()?;
+        }
+        self.stdout
+            .set_color(ColorSpec::new().set_fg(Some(Color::Green)))?;
+        write!(self.stdout, "{}", line_no)?;
+        self.stdout
+            .set_color(ColorSpec::new().set_fg(Some(Color::Cyan)))?;
+        write!(self.stdout, ":")?;
+        self.stdout.reset()?;
+        self.stdout
+            .set_color(ColorSpec::new().set_fg(Some(Color::Green)))?;
+        write!(self.stdout, "{}", col)?;
+        self.stdout
+            .set_color(ColorSpec::new().set_fg(Some(Color::Cyan)))?;
+        write!(self.stdout, ":")?;
+        self.stdout.reset()?;
+        Ok(())
+    }
+
+    /// 打印单行
+    fn print_one_line(&mut self, path: &str, line: &OutputLine) -> Result<()> {
+        match line {
+            OutputLine::Match {
+                line_no,
+                line,
+                matches,
+            } => {
+                self.print_match(path, *line_no, line, matches)?;
+            }
+            OutputLine::MatchOnly { line_no, text } => {
+                self.print_match_only(path, *line_no, text)?;
+            }
+            OutputLine::Context { line_no, line } => {
+                self.print_context(path, *line_no, line, false)?;
+            }
+            OutputLine::Separator => {
+                self.print_context("", 0, "", true)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// heading 模式：打印文件名
+    fn print_heading(&mut self, path: &str) -> Result<()> {
         self.stdout
             .set_color(ColorSpec::new().set_fg(Some(Color::Magenta)).set_bold(true))?;
         writeln!(self.stdout, "{}", path)?;
+        self.stdout.reset()?;
+        self.last_heading = Some(path.to_string());
+        Ok(())
+    }
+
+    /// 对外公开的文件名输出（`-l` / `--name` / `--files` / `--files-without-match`）
+    pub fn print_filename_pub(&mut self, path: &str) -> Result<()> {
+        self.stdout
+            .set_color(ColorSpec::new().set_fg(Some(Color::Magenta)).set_bold(true))?;
+        if self.null_separator {
+            write!(self.stdout, "{}\0", path)?;
+        } else {
+            writeln!(self.stdout, "{}", path)?;
+        }
         self.stdout.reset()?;
         Ok(())
     }
@@ -160,6 +305,18 @@ impl Printer {
             self.stdout
                 .set_color(ColorSpec::new().set_fg(Some(Color::Green)))?;
             write!(self.stdout, "{}", line_no)?;
+            self.stdout
+                .set_color(ColorSpec::new().set_fg(Some(Color::Cyan)))?;
+            write!(self.stdout, ":")?;
+            self.stdout.reset()?;
+        }
+
+        if self.show_column {
+            // 取第一个匹配的列号（1-based）；没有匹配时列号为 1
+            let col = matches.first().map(|(s, _)| s + 1).unwrap_or(1);
+            self.stdout
+                .set_color(ColorSpec::new().set_fg(Some(Color::Green)))?;
+            write!(self.stdout, "{}", col)?;
             self.stdout
                 .set_color(ColorSpec::new().set_fg(Some(Color::Cyan)))?;
             write!(self.stdout, ":")?;

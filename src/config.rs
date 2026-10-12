@@ -29,6 +29,8 @@ pub struct Config {
     // 布尔开关
     pub ignore_case: Option<bool>,
     pub line_number: Option<bool>,
+    pub column: Option<bool>,
+    pub vimgrep: Option<bool>,
     pub hidden: Option<bool>,
     pub follow: Option<bool>,
     pub word: Option<bool>,
@@ -40,6 +42,11 @@ pub struct Config {
     pub sort: Option<bool>,
     pub stats: Option<bool>,
     pub json: Option<bool>,
+    pub no_filename: Option<bool>,
+    pub with_filename: Option<bool>,
+    pub null_separator: Option<bool>,
+    pub heading: Option<bool>,
+    pub no_heading: Option<bool>,
 
     // 数值
     pub context: Option<usize>,
@@ -84,17 +91,14 @@ impl Config {
     ///
     /// 优先级：搜索路径里的 `.fsearch.toml` > 当前工作目录里的 `.fsearch.toml`。
     pub fn load_with_cwd(root: &Path) -> Result<Self> {
-        // 1) 搜索路径
         let path_cfg = root.join(CONFIG_FILENAME);
         if path_cfg.exists() {
             return Self::load(root);
         }
 
-        // 2) 当前工作目录
         if let Ok(cwd) = std::env::current_dir() {
             let cwd_cfg = cwd.join(CONFIG_FILENAME);
             if cwd_cfg.exists() {
-                // 防止 root 就是 cwd 的情况（虽然已经查过 root，但保险）
                 let same = match (root.canonicalize(), cwd.canonicalize()) {
                     (Ok(a), Ok(b)) => a == b,
                     _ => false,
@@ -105,7 +109,6 @@ impl Config {
             }
         }
 
-        // 3) 都没有：空配置
         Ok(Self::default())
     }
 }
@@ -224,19 +227,35 @@ glob = "*.rs"
     fn load_with_cwd_prefers_root() {
         let dir = TempDir::new("cwd_root");
         dir.write(CONFIG_FILENAME, "ignore_case = true\n");
-        // root 有配置，应该用它
         let cfg = Config::load_with_cwd(&dir.0).unwrap();
         assert_eq!(cfg.ignore_case, Some(true));
     }
 
     #[test]
     fn load_with_cwd_falls_back_to_cwd() {
-        // 这个测试无法在不改 CWD 的情况下直接验证 fallback，
-        // 只验证 root 没有配置时不会 panic
         let dir = TempDir::new("cwd_fallback");
         let cfg = Config::load_with_cwd(&dir.0).unwrap();
-        // root 没有 .fsearch.toml，可能从 CWD 加载也可能空配置，
-        // 但不应报错
         let _ = cfg;
+    }
+
+    #[test]
+    fn load_output_control_fields() {
+        let dir = TempDir::new("output");
+        dir.write(
+            CONFIG_FILENAME,
+            r#"
+column = true
+vimgrep = true
+heading = true
+no_filename = true
+null_separator = true
+"#,
+        );
+        let cfg = Config::load(&dir.0).unwrap();
+        assert_eq!(cfg.column, Some(true));
+        assert_eq!(cfg.vimgrep, Some(true));
+        assert_eq!(cfg.heading, Some(true));
+        assert_eq!(cfg.no_filename, Some(true));
+        assert_eq!(cfg.null_separator, Some(true));
     }
 }

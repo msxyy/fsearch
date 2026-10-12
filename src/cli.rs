@@ -11,7 +11,8 @@ use clap::Parser;
 -u    不读 .gitignore\n\
 -uu   不读 .gitignore，且搜索隐藏文件\n\
 -uuu  不读 .gitignore，搜索隐藏文件和二进制文件\n\n\
-在搜索目录下放置 .fsearch.toml 可指定默认选项；命令行参数始终覆盖配置文件。")]
+在搜索目录或当前工作目录放置 .fsearch.toml 可指定默认选项；命令行参数始终覆盖配置文件。\n\
+使用 --no-config 可显式忽略配置文件。")]
 pub struct Cli {
     /// 搜索模式；使用 -e 时可省略；--files 模式下位置参数是路径
     pub pattern: Option<String>,
@@ -79,6 +80,14 @@ pub struct Cli {
     /// 显示行号
     #[arg(short = 'n', long, num_args = 0, default_missing_value = "true")]
     pub line_number: Option<bool>,
+
+    /// 显示列号（每个匹配的 1-based 列）
+    #[arg(long, num_args = 0, default_missing_value = "true")]
+    pub column: Option<bool>,
+
+    /// vimgrep 格式：file:line:col:content，每个匹配一行
+    #[arg(long, num_args = 0, default_missing_value = "true")]
+    pub vimgrep: Option<bool>,
 
     /// 只输出匹配到的文件名
     #[arg(short = 'l', long, num_args = 0, default_missing_value = "true")]
@@ -154,13 +163,42 @@ pub struct Cli {
     #[arg(short = 'g', long)]
     pub glob: Option<String>,
 
-    /// 为指定目录建立/更新内容索引，保存到 <DIR>/.fsearch-index
+    /// 不显示文件名
+    #[arg(long = "no-filename", num_args = 0, default_missing_value = "true")]
+    pub no_filename: Option<bool>,
+
+    /// 强制显示文件名（默认行为）
+    #[arg(long = "with-filename", num_args = 0, default_missing_value = "true")]
+    pub with_filename: Option<bool>,
+
+    /// 每个匹配之后输出 NUL 字节而不是换行（常与 -l 一起用于 xargs）
+    #[arg(
+        short = '0',
+        long = "null",
+        num_args = 0,
+        default_missing_value = "true"
+    )]
+    pub null_separator: Option<bool>,
+
+    /// 按文件分组输出：先打印文件名，再打印该文件的所有匹配
+    #[arg(long, num_args = 0, default_missing_value = "true")]
+    pub heading: Option<bool>,
+
+    /// 不使用分组输出（默认）
+    #[arg(long = "no-heading", num_args = 0, default_missing_value = "true")]
+    pub no_heading: Option<bool>,
+
+    /// 为指定目录建立/更新内容索引，保存到用户缓存目录
     #[arg(long = "build-index", value_name = "DIR")]
     pub build_index: Option<String>,
 
     /// 使用已有索引加速搜索（仅支持长度 ≥ 3 的字面量 pattern）
     #[arg(long, num_args = 0, default_missing_value = "true")]
     pub use_index: Option<bool>,
+
+    /// 不读取 .fsearch.toml 配置文件
+    #[arg(long, num_args = 0, default_missing_value = "true")]
+    pub no_config: Option<bool>,
 
     /// 生成 shell 补全脚本到 stdout（bash / zsh / fish / powershell / elvish）
     #[arg(long, hide = true, value_name = "SHELL")]

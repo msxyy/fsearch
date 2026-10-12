@@ -853,7 +853,7 @@ fn use_index_auto_builds_when_missing() {
     dir.file("a.txt", "hello world\n");
     dir.file("b.txt", "foo bar\n");
 
-    // v0.5.0：没有索引时 --use-index 自动建立并使用，而不是报错
+    // v0.5.0：没有索引时 --use-index 自动建立并使用
     let out = fsearch()
         .arg("--use-index")
         .arg("hello")
@@ -870,12 +870,23 @@ fn use_index_auto_builds_when_missing() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("hello"), "stdout: {stdout}");
 
-    // 索引文件应该被创建
-    assert!(dir.0.join(".fsearch-index").exists());
-
-    // stderr 应该有提示
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("索引"), "stderr: {stderr}");
+
+    // v0.7.0：索引在用户缓存目录，不在项目目录
+    // 第二次调用不应该再打印"索引已建立或更新"
+    let out = fsearch()
+        .arg("--use-index")
+        .arg("hello")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("索引已建立或更新"),
+        "第二次 stderr 不该有重建提示：{stderr}"
+    );
 }
 
 #[test]
@@ -883,7 +894,6 @@ fn use_index_auto_rebuilds_when_stale() {
     let dir = TempDir::new("idx_stale");
     dir.file("a.txt", "hello\n");
 
-    // 先建好索引
     let out = fsearch()
         .arg("--build-index")
         .arg(dir.0.to_str().unwrap())
@@ -891,11 +901,9 @@ fn use_index_auto_rebuilds_when_stale() {
         .unwrap();
     assert!(out.status.success());
 
-    // 添加新文件，索引应该过期
     std::thread::sleep(std::time::Duration::from_millis(1100));
     dir.file("b.txt", "hello\n");
 
-    // --use-index 应该自动重建索引，两个文件都搜到
     let out = fsearch()
         .arg("--use-index")
         .arg("hello")
@@ -929,7 +937,6 @@ fn use_index_with_regex_falls_back() {
         .unwrap();
     assert!(out.status.success());
 
-    // 含正则元字符，会回退到全量扫描
     let out = fsearch()
         .arg("--use-index")
         .arg("hel.*o")
@@ -968,7 +975,6 @@ fn cli_overrides_config() {
     dir.file(".fsearch.toml", "ignore_case = true\n");
     dir.file("a.txt", "HELLO\n");
 
-    // CLI 不设 -i，但配置文件设了，所以会命中
     let out = fsearch()
         .arg("hello")
         .arg(dir.0.to_str().unwrap())
@@ -976,8 +982,6 @@ fn cli_overrides_config() {
         .unwrap();
     assert!(out.status.success());
 
-    // CLI 明确给 --no-ignore-case 并不存在；改用另一种方式：
-    // 配置文件设 line_number = true，CLI 覆盖不了布尔 false，这里只验证配置文件生效
     let out = fsearch()
         .arg("--line-number")
         .arg("hello")
@@ -985,7 +989,6 @@ fn cli_overrides_config() {
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // 应该有行号 "a.txt:1:HELLO"
     assert!(stdout.contains(":1:"), "stdout: {stdout}");
 }
 
@@ -1016,7 +1019,6 @@ fn config_cli_type_filter_overrides() {
     dir.file("a.rs", "needle\n");
     dir.file("b.py", "needle\n");
 
-    // CLI 的 --type 覆盖配置文件
     let out = fsearch()
         .arg("--type")
         .arg("python")
@@ -1078,7 +1080,6 @@ fn index_incremental_reuses_and_updates() {
     dir.file("a.txt", "hello\n");
     dir.file("b.txt", "world\n");
 
-    // 首次建立
     let out = fsearch()
         .arg("--build-index")
         .arg(dir.0.to_str().unwrap())
@@ -1086,11 +1087,9 @@ fn index_incremental_reuses_and_updates() {
         .unwrap();
     assert!(out.status.success());
 
-    // 修改一个文件
     std::thread::sleep(std::time::Duration::from_millis(1100));
     dir.file("a.txt", "hello changed to needle\n");
 
-    // 用索引搜索，应自动重建，且复用 b.txt
     let out = fsearch()
         .arg("--use-index")
         .arg("needle")
@@ -1110,26 +1109,276 @@ fn index_incremental_reuses_and_updates() {
 }
 
 #[test]
-fn old_index_format_rebuilt() {
-    let dir = TempDir::new("idx_old_fmt");
+fn use_index_works_every_time() {
+    let dir = TempDir::new("idx_repeat");
     dir.file("a.txt", "hello\n");
+    dir.file("b.txt", "world\n");
 
-    // 写一个假的旧格式索引
-    fs::write(dir.0.join(".fsearch-index"), b"FSIDX001old format").unwrap();
-
-    // --use-index 应该自动丢弃旧索引并重建
+    // 第一次：自动建索引
     let out = fsearch()
         .arg("--use-index")
         .arg("hello")
         .arg(dir.0.to_str().unwrap())
         .output()
         .unwrap();
-
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("hello"), "stdout: {stdout}");
+
+    // 第二次：应该直接复用索引，不再打印重建提示
+    let out = fsearch()
+        .arg("--use-index")
+        .arg("world")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("索引已建立或更新"),
+        "第二次不该重建：{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("world"), "stdout: {stdout}");
+}
+
+// ---------- v0.7.0：--no-config ----------
+
+#[test]
+fn no_config_ignores_config_file() {
+    let dir = TempDir::new("no_cfg");
+    dir.file(".fsearch.toml", "ignore_case = true\n");
+    dir.file("a.txt", "HELLO\n");
+
+    // 正常情况：配置文件生效，小写能匹配
+    let out = fsearch()
+        .arg("hello")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // --no-config：忽略配置文件，小写搜不到
+    let out = fsearch()
+        .arg("--no-config")
+        .arg("hello")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "应该找不到（没忽略大小写）");
+
+    // 大写能搜到
+    let out = fsearch()
+        .arg("--no-config")
+        .arg("HELLO")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+}
+
+// ---------- v0.7.0：索引持久化到缓存目录 ----------
+
+#[test]
+fn index_not_in_project_dir() {
+    let dir = TempDir::new("idx_cache");
+    dir.file("a.txt", "hello\n");
+
+    let out = fsearch()
+        .arg("--build-index")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // 索引不应出现在项目目录里
+    assert!(
+        !dir.0.join(".fsearch-index").exists(),
+        "索引不该在项目目录里"
+    );
+
+    // stderr 应该打印出索引路径
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(".fsearch-index"),
+        "stderr 应包含索引路径：{stderr}"
+    );
+}
+
+#[test]
+fn index_persists_across_runs() {
+    let dir = TempDir::new("idx_persist");
+    dir.file("a.txt", "hello\n");
+
+    // 第一次建立
+    let out = fsearch()
+        .arg("--build-index")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // 第二次：--use-index 应该不再重建
+    let out = fsearch()
+        .arg("--use-index")
+        .arg("hello")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("索引更新完成"), "第二次不该重建：{stderr}");
+}
+
+// ---------- v0.8.0：--column / --vimgrep / --no-filename / -0 / --heading ----------
+
+#[test]
+fn column_shows_column_number() {
+    let dir = TempDir::new("column");
+    dir.file("a.txt", "xx needle yy\n");
+
+    let out = fsearch()
+        .arg("--column")
+        .arg("needle")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // needle 从第 4 列开始（1-based）
+    assert!(stdout.contains(":4:"), "stdout: {stdout}");
+}
+
+#[test]
+fn vimgrep_format() {
+    let dir = TempDir::new("vimgrep");
+    dir.file("a.txt", "hello world\n");
+
+    let out = fsearch()
+        .arg("--vimgrep")
+        .arg("world")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // 格式：path:line:col:content
+    assert!(stdout.contains(":1:7:hello world"), "stdout: {stdout}");
+}
+
+#[test]
+fn vimgrep_multiple_matches_per_line() {
+    let dir = TempDir::new("vimgrep_multi");
+    dir.file("a.txt", "foo bar foo\n");
+
+    let out = fsearch()
+        .arg("--vimgrep")
+        .arg("foo")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // 同一行的两个匹配应该各自输出一行
+    assert!(stdout.contains(":1:1:foo bar foo"), "stdout: {stdout}");
+    assert!(stdout.contains(":1:9:foo bar foo"), "stdout: {stdout}");
+}
+
+#[test]
+fn no_filename_hides_filename() {
+    let dir = TempDir::new("nofn");
+    dir.file("a.txt", "hello\n");
+
+    let out = fsearch()
+        .arg("--no-filename")
+        .arg("hello")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("a.txt"), "stdout: {stdout}");
+    assert!(stdout.contains("hello"));
+}
+
+#[test]
+fn null_separator_with_files_with_matches() {
+    let dir = TempDir::new("nullsep");
+    dir.file("a.txt", "needle\n");
+    dir.file("b.txt", "needle\n");
+
+    let out = fsearch()
+        .arg("-l")
+        .arg("-0")
+        .arg("needle")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    // stdout 里应该有 \0 字节
+    assert!(out.stdout.contains(&0), "stdout 应含 NUL 字节");
+}
+
+#[test]
+fn heading_groups_by_file() {
+    let dir = TempDir::new("heading");
+    dir.file("a.txt", "needle\nother\nneedle\n");
+    dir.file("b.txt", "needle\n");
+
+    let out = fsearch()
+        .arg("--heading")
+        .arg("needle")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // heading 模式下每个文件名只出现一次
+    let count_a = stdout.matches("a.txt").count();
+    let count_b = stdout.matches("b.txt").count();
+    assert_eq!(count_a, 1, "a.txt 应该只出现一次：{stdout}");
+    assert_eq!(count_b, 1, "b.txt 应该只出现一次：{stdout}");
+}
+
+#[test]
+fn no_heading_overrides_heading() {
+    let dir = TempDir::new("noheading");
+    dir.file("a.txt", "needle\n");
+
+    // heading 与 no-heading 同时给时，no-heading 优先
+    let out = fsearch()
+        .arg("--heading")
+        .arg("--no-heading")
+        .arg("needle")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // 普通模式：a.txt:needle
+    assert!(stdout.contains("a.txt:needle"), "stdout: {stdout}");
+}
+
+#[test]
+fn column_in_config_file() {
+    let dir = TempDir::new("cfg_col");
+    dir.file(".fsearch.toml", "column = true\n");
+    dir.file("a.txt", "xx needle yy\n");
+
+    let out = fsearch()
+        .arg("needle")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(":4:"), "stdout: {stdout}");
 }

@@ -201,12 +201,18 @@ fn run() -> Result<bool> {
         (Some(pats), cli.path.clone())
     };
 
-    // 加载配置文件
-    let cfg = Config::load_with_cwd(Path::new(&path))?;
+    // 加载配置文件；--no-config 时跳过
+    let cfg = if cli.no_config.unwrap_or(false) {
+        Config::default()
+    } else {
+        Config::load_with_cwd(Path::new(&path))?
+    };
 
     // 合并 CLI 与配置文件：CLI 优先
     let ignore_case = cli.ignore_case.or(cfg.ignore_case).unwrap_or(false);
     let line_number = cli.line_number.or(cfg.line_number).unwrap_or(false);
+    let column = cli.column.or(cfg.column).unwrap_or(false);
+    let vimgrep = cli.vimgrep.or(cfg.vimgrep).unwrap_or(false);
     let word = cli.word.or(cfg.word).unwrap_or(false);
     let fixed = cli.fixed.or(cfg.fixed).unwrap_or(false);
     let invert = cli.invert.or(cfg.invert).unwrap_or(false);
@@ -220,6 +226,24 @@ fn run() -> Result<bool> {
     let count_matches = cli.count_matches.unwrap_or(false);
     let count = cli.count.unwrap_or(false) || count_matches;
     let use_index = cli.use_index.unwrap_or(false);
+
+    // 文件名 / heading / NUL 分隔符
+    let no_filename = cli.no_filename.or(cfg.no_filename).unwrap_or(false);
+    let with_filename = cli.with_filename.or(cfg.with_filename).unwrap_or(false);
+    let null_separator = cli.null_separator.or(cfg.null_separator).unwrap_or(false);
+    let no_heading = cli.no_heading.or(cfg.no_heading).unwrap_or(false);
+    let heading = if no_heading {
+        false
+    } else {
+        cli.heading.or(cfg.heading).unwrap_or(false)
+    };
+    // 显示文件名：--with-filename 优先；否则 --no-filename 关闭；
+    // vimgrep 模式和 heading 模式强制显示文件名。
+    let show_filename = if vimgrep || heading || with_filename {
+        true
+    } else {
+        !no_filename
+    };
 
     let no_ignore = cli.no_ignore.or(cfg.no_ignore).unwrap_or(false)
         || cli.unrestricted >= 1
@@ -277,7 +301,6 @@ fn run() -> Result<bool> {
         }
     };
 
-    // 替换只对普通匹配输出生效
     let replace: Option<Arc<String>> =
         if json || files_with_matches || files_without_match || count || only_matching {
             None
@@ -285,7 +308,6 @@ fn run() -> Result<bool> {
             cli.replace.clone().or(cfg.replace.clone()).map(Arc::new)
         };
 
-    // 字面量预筛
     let prefilter: Option<Arc<Prefilter>> = if !invert && mode == Mode::Content {
         patterns_opt.as_ref().and_then(|pats| {
             literal_patterns(pats, fixed, word)
@@ -296,23 +318,20 @@ fn run() -> Result<bool> {
         None
     };
 
-    // --use-index：加载或增量更新索引
+    // --use-index：只在 pattern 可以被索引加速时才加载/建索引
     let candidate_paths: Option<Vec<String>> = if use_index && mode == Mode::Content {
-        let root_path = Path::new(&path);
-        let (idx, updated) = index::load_or_update(root_path)?;
-        if updated {
-            eprintln!("fsearch: 索引已建立或更新");
-        }
         match patterns_opt.as_ref().and_then(|v| v.first()) {
-            Some(first) => match idx.candidates(first) {
-                Some(c) => Some(c),
-                None => {
-                    eprintln!(
-                        "fsearch: pattern 含正则元字符或长度不足 3，索引模式仅支持字面量搜索，回退到全量扫描"
-                    );
-                    None
-                }
-            },
+            Some(first) if index::is_indexable(first) => {
+                let root_path = Path::new(&path);
+                let (idx, _updated) = index::load_or_update(root_path)?;
+                idx.candidates(first)
+            }
+            Some(_) => {
+                eprintln!(
+                    "fsearch: pattern 含正则元字符或长度不足 3，索引模式仅支持字面量搜索，回退到全量扫描"
+                );
+                None
+            }
             None => None,
         }
     } else {
@@ -372,7 +391,13 @@ fn run() -> Result<bool> {
     } else if json {
         Output::Json(JsonPrinter::new())
     } else {
-        Output::Plain(Printer::new(color_choice, line_number))
+        let printer = Printer::new(color_choice, line_number)
+            .with_filename(show_filename)
+            .with_column(column)
+            .with_vimgrep(vimgrep)
+            .with_heading(heading)
+            .with_null_separator(null_separator);
+        Output::Plain(printer)
     };
 
     let any_found = Arc::new(AtomicBool::new(false));

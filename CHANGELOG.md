@@ -7,6 +7,42 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-12
+
+### Added
+
+- 索引持久化到用户缓存目录，不再污染项目目录
+  - Windows：`%LOCALAPPDATA%\fsearch\cache\<hash>.fsearch-index`
+  - macOS：`~/Library/Caches/fsearch/cache/<hash>.fsearch-index`
+  - Linux：`$XDG_CACHE_HOME/fsearch/cache/<hash>.fsearch-index` 或 `~/.cache/fsearch/cache/<hash>.fsearch-index`
+  - 缓存目录不可用时回退到项目目录的 `.fsearch-index`
+  - 缓存文件名是目录规范化路径的哈希，同一目录多次调用自动复用
+- `--no-config`：显式忽略 `.fsearch.toml` 配置文件
+- `index::is_indexable(pattern)`：判断 pattern 是否可被索引加速
+- `--column`：显示每个匹配的 1-based 列号
+- `--vimgrep`：输出 `file:line:col:content`，同一行的多个匹配各占一行
+- `--no-filename` / `--with-filename`：控制是否显示文件名
+- `-0` / `--null`：路径之间用 NUL 字节分隔，方便管道传给 `xargs -0`
+- `--heading` / `--no-heading`：按文件分组输出，文件名单独一行
+- 字节级预筛：无上下文（`-A`/`-B` 都为 0）时，预筛直接在 `&[u8]` 上跑，
+  不命中的行跳过 UTF-8 解码
+
+### Changed
+
+- `--use-index` 参数类型从 `bool` 改为 `Option<bool>`
+- `--use-index` 会先判断 pattern 是否可被索引加速；不可以时不建索引，直接回退
+- `Prefilter` 新增 `might_match_bytes(&[u8])`
+- `LineSource::Stream` 增加 `prefilter` / `skip_prefilter` 字段
+- `Printer` 新增 `with_filename` / `with_column` / `with_vimgrep` /
+  `with_heading` / `with_null_separator` 构建方法
+- `Config` 新增 `column` / `vimgrep` / `heading` / `no_heading` /
+  `no_filename` / `with_filename` / `null_separator` 字段
+
+### Fixed
+
+- 缓存路径补上 `cache` 子目录，与文档一致
+- heading 模式不再重复打印文件名
+
 ## [0.6.1] - 2026-10-12
 
 ### Fixed
@@ -109,7 +145,8 @@
 - 支持非 UTF-8，跳过二进制文件
 - 退出码：0 找到 / 1 未找到 / 2 出错
 
-[Unreleased]: https://github.com/msxyy/fsearch/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/msxyy/fsearch/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/msxyy/fsearch/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/msxyy/fsearch/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/msxyy/fsearch/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/msxyy/fsearch/compare/v0.4.0...v0.5.0

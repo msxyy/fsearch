@@ -14,7 +14,7 @@ use regex::Regex;
 /// 字面量预筛器
 ///
 /// 比正则快得多，用来快速排除不可能命中的行。
-/// **只用于快速排除**：`might_match` 返回 false 的行一定不命中；
+/// **只用于快速排除**：`might_match*` 返回 false 的行一定不命中；
 /// 返回 true 的行还需要交给 regex 复核。
 pub struct Prefilter {
     ac: AhoCorasick,
@@ -36,9 +36,17 @@ impl Prefilter {
         Some(Self { ac })
     }
 
-    /// 这一行是否可能命中？
+    /// 这一行（UTF-8 字符串）是否可能命中？
     pub fn might_match(&self, line: &str) -> bool {
         self.ac.is_match(line)
+    }
+
+    /// 这一行（原始字节）是否可能命中？
+    ///
+    /// 比 `might_match(&str)` 快，因为跳过了 UTF-8 解码。
+    /// 不命中的行可以直接在字节层面丢弃。
+    pub fn might_match_bytes(&self, bytes: &[u8]) -> bool {
+        self.ac.is_match(bytes)
     }
 }
 
@@ -113,10 +121,16 @@ fn apply_replace(re: &Regex, line: &str, replacement: &str) -> String {
 }
 
 /// 流式读取来源
+///
+/// Stream 分支支持**字节级预筛**：当不需要上下文时，先把行当成字节
+/// 交给预筛器，不命中的行直接跳过，省掉 UTF-8 解码。
 enum LineSource {
     Stream {
         reader: BufReader<File>,
         buf: Vec<u8>,
+        prefilter: Option<Arc<Prefilter>>,
+        /// 是否跳过预筛（有上下文时不能跳过，因为上下文行要原样输出）
+        skip_prefilter: bool,
     },
     Memory(std::vec::IntoIter<String>),
 }
@@ -124,23 +138,37 @@ enum LineSource {
 impl LineSource {
     fn next_line(&mut self) -> Option<String> {
         match self {
-            LineSource::Stream { reader, buf } => {
+            LineSource::Stream {
+                reader,
+                buf,
+                prefilter,
+                skip_prefilter,
+            } => loop {
                 buf.clear();
-                match reader.read_until(b'\n', buf) {
-                    Ok(0) => None,
-                    Ok(n) => {
-                        let mut end = n;
-                        if end > 0 && buf[end - 1] == b'\n' {
-                            end -= 1;
-                        }
-                        if end > 0 && buf[end - 1] == b'\r' {
-                            end -= 1;
-                        }
-                        Some(String::from_utf8_lossy(&buf[..end]).into_owned())
-                    }
-                    Err(_) => None,
+                let n = match reader.read_until(b'\n', buf) {
+                    Ok(0) => return None,
+                    Ok(n) => n,
+                    Err(_) => return None,
+                };
+                let mut end = n;
+                if end > 0 && buf[end - 1] == b'\n' {
+                    end -= 1;
                 }
-            }
+                if end > 0 && buf[end - 1] == b'\r' {
+                    end -= 1;
+                }
+
+                // 字节级预筛：不命中的行直接跳过解码
+                if !*skip_prefilter {
+                    if let Some(pf) = prefilter {
+                        if !pf.might_match_bytes(&buf[..end]) {
+                            continue;
+                        }
+                    }
+                }
+
+                return Some(String::from_utf8_lossy(&buf[..end]).into_owned());
+            },
             LineSource::Memory(it) => it.next(),
         }
     }
@@ -191,9 +219,13 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
                     return Ok(result);
                 }
             };
+            // 有上下文时不能用字节级预筛（上下文行必须原样输出）
+            let skip_prefilter = opts.before > 0 || opts.after > 0;
             LineSource::Stream {
                 reader: BufReader::new(file),
                 buf: Vec::new(),
+                prefilter: opts.prefilter.clone(),
+                skip_prefilter,
             }
         }
     };
@@ -225,10 +257,11 @@ pub fn search_file(path: &Path, re: &Regex, opts: &SearchOptions) -> Result<File
             break;
         }
 
-        // 字面量预筛：快速排除不可能命中的行
-        let candidate = match &opts.prefilter {
-            Some(pf) => pf.might_match(&line),
-            None => true,
+        // 字符串级预筛：只在 Stream 分支 skip_prefilter=false 时才会走到这里
+        // （即：有上下文，字节级预筛被跳过，需要在 String 上再筛一次）
+        let candidate = match (&opts.prefilter, use_context) {
+            (Some(pf), true) => pf.might_match(&line),
+            _ => true,
         };
         let is_match = if candidate { re.is_match(&line) } else { false };
         let hit = if opts.invert { !is_match } else { is_match };
@@ -741,5 +774,62 @@ mod tests {
         opts.prefilter = Some(pf);
         let r = search_file(&file, &re("needle"), &opts).unwrap();
         assert_eq!(r.match_count, 1);
+    }
+
+    // ---------- 字节级预筛（v0.8.0） ----------
+
+    #[test]
+    fn prefilter_bytes_matches() {
+        let pf = Prefilter::new(&["needle".to_string()], false).unwrap();
+        assert!(pf.might_match_bytes(b"a needle here"));
+        assert!(!pf.might_match_bytes(b"no match here"));
+    }
+
+    #[test]
+    fn prefilter_bytes_works_with_non_utf8() {
+        let pf = Prefilter::new(&["needle".to_string()], false).unwrap();
+        // 含非法 UTF-8 字节，但 needle 在
+        assert!(pf.might_match_bytes(b"\xff\xfeneedle\xff"));
+        // 不含 needle
+        assert!(!pf.might_match_bytes(b"\xff\xfe\xff"));
+    }
+
+    #[test]
+    fn byte_prefilter_skips_without_context() {
+        let dir = TempDir::new("byte_pf");
+        let file = dir.file("a.txt", "first\nneedle\nthird\n");
+        let pf = Arc::new(Prefilter::new(&["needle".to_string()], false).unwrap());
+        let mut opts = default_opts();
+        opts.prefilter = Some(pf);
+        // 无上下文：字节级预筛生效
+        let r = search_file(&file, &re("needle"), &opts).unwrap();
+        assert_eq!(r.match_count, 1);
+        assert_eq!(output_lines(&r), vec!["M:needle"]);
+    }
+
+    #[test]
+    fn byte_prefilter_skips_with_context() {
+        let dir = TempDir::new("byte_pf_ctx");
+        let file = dir.file("a.txt", "l1\nneedle\nl3\n");
+        let pf = Arc::new(Prefilter::new(&["needle".to_string()], false).unwrap());
+        let mut opts = default_opts();
+        opts.prefilter = Some(pf);
+        opts.before = 1;
+        opts.after = 1;
+        // 有上下文：字节级预筛被跳过，但字符串级预筛仍生效
+        let r = search_file(&file, &re("needle"), &opts).unwrap();
+        assert_eq!(output_lines(&r), vec!["C:l1", "M:needle", "C:l3"]);
+    }
+
+    #[test]
+    fn byte_prefilter_non_utf8_with_context() {
+        let dir = TempDir::new("byte_pf_nonutf8");
+        // 含非法 UTF-8 字节，且没有 needle
+        let path = dir.file_bytes("a.txt", b"line1\n\xff\xfe\nline3\n");
+        let pf = Arc::new(Prefilter::new(&["needle".to_string()], false).unwrap());
+        let mut opts = default_opts();
+        opts.prefilter = Some(pf);
+        let r = search_file(&path, &re("xyz"), &opts).unwrap();
+        assert!(!r.matched);
     }
 }
