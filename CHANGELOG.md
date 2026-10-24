@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-24
+
 ### Added
 
 - 短名 `fs`：`fsearch` 的第二个可执行入口，两个 bin 共用同一份 CLI 逻辑
@@ -179,7 +181,8 @@
 - 支持非 UTF-8，跳过二进制文件
 - 退出码：0 找到 / 1 未找到 / 2 出错
 
-[Unreleased]: https://github.com/msxyy/fsearch/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/msxyy/fsearch/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/msxyy/fsearch/compare/v0.7.3...v0.8.0
 [0.7.3]: https://github.com/msxyy/fsearch/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/msxyy/fsearch/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/msxyy/fsearch/compare/v0.7.0...v0.7.1
