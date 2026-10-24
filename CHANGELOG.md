@@ -7,6 +7,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- 短名 `fs`：`fsearch` 的第二个可执行入口，两个 bin 共用同一份 CLI 逻辑
+  - 程序名取自 `argv[0]`，所以 `fs --help`、`fs --version`、
+    `fs --generate-man`、`fs --generate-completions` 显示的都是 `fs`
+  - 发布包（Windows zip / Unix tar.gz）同时包含 `fsearch` 和 `fs`
+
+### Changed
+
+- CLI 主流程从 `src/main.rs` 移到 `src/app.rs`（`lib.rs` 新增 `app` / `cli` 模块），
+  `src/main.rs` 变成薄包装；`src/bin/fs.rs` 同样只有三行
+- 库新增公共入口 `fsearch::app::run()`（别名 `fsearch::run_cli`）
+
 ## [0.7.3] - 2026-10-13
 
 ### Fixed

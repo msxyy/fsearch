@@ -18,12 +18,15 @@
 //! println!("{} 命中 {} 行", result.path, result.match_count);
 //! ```
 
+pub mod app;
+pub mod cli;
 pub mod config;
 pub mod index;
 pub mod pattern;
 pub mod printer;
 pub mod search;
 
+pub use app::run as run_cli;
 pub use config::{Config, CONFIG_FILENAME};
 pub use index::{build_and_save, index_path, is_indexable, load_or_update, Index};
 pub use pattern::{build_combined_pattern, build_pattern, literal_patterns};

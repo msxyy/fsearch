@@ -20,6 +20,10 @@ path = "src/lib.rs"
 name = "fsearch"
 path = "src/main.rs"
 
+[[bin]]
+name = "fs"
+path = "src/bin/fs.rs"
+
 [[bench]]
 name = "search"
 harness = false

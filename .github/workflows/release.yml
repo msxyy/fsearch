@@ -42,14 +42,14 @@ jobs:
         if: matrix.os != 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.archive }} fsearch
+          tar czf ../../../${{ matrix.archive }} fsearch fs
 
       - name: Package (windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           cd target/${{ matrix.target }}/release
-          Compress-Archive -Path fsearch.exe -DestinationPath ../../../${{ matrix.archive }}
+          Compress-Archive -Path fsearch.exe,fs.exe -DestinationPath ../../../${{ matrix.archive }}
 
       - name: Upload
         uses: softprops/action-gh-release@v2

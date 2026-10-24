@@ -6,6 +6,13 @@
 
 用 Rust 写的文件内容搜索器，是 ripgrep 的简化版。
 
+安装后可以用全名 `fsearch`，也可以用短名 **`fs`**——两者是同一份代码的两个入口，功能和参数完全一致：
+
+```bash
+fsearch -n "fn main" ./src
+fs      -n "fn main" ./src    # 少敲 5 个字符
+```
+
 ## 下载
 
 不想自己编译？直接下载预编译版本：
@@ -19,8 +26,11 @@
 | macOS Intel | `fsearch-macos-x86_64.tar.gz` |
 | macOS Apple Silicon | `fsearch-macos-aarch64.tar.gz` |
 
+每个压缩包里同时包含 `fsearch` 和短名 `fs`（Windows 下是 `fsearch.exe` / `fs.exe`），解压后放到 `PATH` 里即可两个都用。
+
 ## 特性
 
+- 双入口：`fsearch` 全名 + **`fs`** 短名，共用同一份代码，帮助 / 版本 / 补全都跟随实际调用名
 - 正则搜索（`regex` crate）+ 字面量预筛（`aho-corasick`）
 - 递归目录 + 自动读取 `.gitignore`
 - 忽略大小写、行号、只列文件名、计数
@@ -66,7 +76,8 @@ cd fsearch
 cargo build --release
 ```
 
-编译好的 exe 在 `target/release/fsearch.exe`（Windows）或 `target/release/fsearch`（Linux/macOS）。
+编译好的 exe 在 `target/release/fsearch.exe` 和 `target/release/fs.exe`（Windows），
+或 `target/release/fsearch` 和 `target/release/fs`（Linux/macOS）。
 
 ### 方式三：cargo install
 
@@ -250,111 +261,121 @@ fsearch [OPTIONS] -e <PATTERN> -e <PATTERN> ... [PATH]
 fsearch [OPTIONS] --files [PATH]
 ```
 
+把 `fsearch` 换成 `fs` 完全等价：
+
+```
+fs [OPTIONS] <PATTERN> [PATH]
+```
+
 `PATTERN` 是搜索模式，默认按正则解释。`PATH` 是搜索路径，默认当前目录。
 
 ### 常用示例
 
+下面统一用短名 `fs`。`fsearch` 是全名，两者是同一份代码，把命令开头的 `fs` 换成 `fsearch` 完全等价。
+
 ```bash
 # 在当前目录搜索
-fsearch "fn main" .
+fs "fn main" .
 
 # 忽略大小写 + 行号
-fsearch -i -n "error" ./src
+fs -i -n "error" ./src
 
 # 只列出匹配到的文件
-fsearch -l "TODO" .
+fs -l "TODO" .
 
 # 只输出匹配行数
-fsearch -c "unsafe" ./src
+fs -c "unsafe" ./src
 
 # 显示匹配行前后各 2 行上下文
-fsearch -C 2 "panic" ./src
+fs -C 2 "panic" ./src
 
 # 全词匹配，不会匹配到 define 里的 fn
-fsearch -w "fn" ./src
+fs -w "fn" ./src
 
 # 反向匹配：输出不含 use 的行
-fsearch -v "use" ./src
+fs -v "use" ./src
 
 # 固定字符串，不解释正则元字符
-fsearch -F "fn(" ./src
+fs -F "fn(" ./src
 
 # 只输出匹配部分
-fsearch -o "fn \w+" ./src
+fs -o "fn \w+" ./src
 
 # 替换匹配部分（不写回文件）
-fsearch -r "BAR" "foo" ./src
+fs -r "BAR" "foo" ./src
 
 # 多个模式，任一匹配即命中
-fsearch -e "fn main" -e "fn run" -n ./src
+fs -e "fn main" -e "fn run" -n ./src
 
 # 只搜 Rust 文件
-fsearch --type rust "Result" .
+fs --type rust "Result" .
 
 # 排除 Rust 文件
-fsearch --type-not rust -l "TODO" .
+fs --type-not rust -l "TODO" .
 
 # 按文件名搜索
-fsearch --name "main" .
+fs --name "main" .
 
 # 只列出会被搜索的文件
-fsearch --files .
+fs --files .
 
 # 列出不含匹配的文件
-fsearch --files-without-match "fn main" ./src
+fs --files-without-match "fn main" ./src
 
 # 统计匹配次数（每次出现都算一次）
-fsearch --count-matches "fn " ./src
+fs --count-matches "fn " ./src
 
 # 输出统计信息
-fsearch --stats "Result" ./src
+fs --stats "Result" ./src
 
 # 排序输出
-fsearch --sort -l "fn " .
+fs --sort -l "fn " .
 
 # 忽略 .gitignore / 隐藏文件 / 二进制
-fsearch -u -l "target" .
-fsearch -uu "target" .
-fsearch -uuu "fsearch" .
+fs -u -l "target" .
+fs -uu "target" .
+fs -uuu "fsearch" .
 
 # 限制递归深度、跳过大于 1MB 的文件
-fsearch --max-depth 1 -l "fn " .
-fsearch --max-filesize 1M -l "fn " .
+fs --max-depth 1 -l "fn " .
+fs --max-filesize 1M -l "fn " .
 
 # 静默模式，只返回退出码
-fsearch -q "fn main" ./src
+fs -q "fn main" ./src
 echo $LASTEXITCODE
 
 # 搜 GBK 编码的文件
-fsearch --encoding gbk "中文" .
+fs --encoding gbk "中文" .
 
 # 为目录建立内容索引
-fsearch --build-index ./src
+fs --build-index ./src
 
 # 使用索引加速搜索（索引会自动检测过期并增量更新）
-fsearch --use-index "fn main" ./src
+fs --use-index "fn main" ./src
 
 # 忽略配置文件
-fsearch --no-config "fn main" ./src
+fs --no-config "fn main" ./src
 
 # 显示列号
-fsearch --column "fn " ./src
+fs --column "fn " ./src
 
 # vimgrep 格式：file:line:col:content
-fsearch --vimgrep "fn main" ./src
+fs --vimgrep "fn main" ./src
 
 # 不显示文件名
-fsearch --no-filename "fn main" ./src
+fs --no-filename "fn main" ./src
 
 # 路径之间用 NUL 分隔（配合 xargs -0）
-fsearch -l -0 "TODO" . | xargs -0 wc -l
+fs -l -0 "TODO" . | xargs -0 wc -l
 
 # 按文件分组输出
-fsearch --heading "fn " ./src
+fs --heading "fn " ./src
 
 # JSON Lines 输出
-fsearch --json "fn main" ./src
+fs --json "fn main" ./src
 ```
+
+> 老习惯改不掉也没关系：`fsearch -n "fn " ./src` 和 `fs -n "fn " ./src` 输出逐字节相同。
 
 ## 所有参数
 
@@ -524,7 +545,9 @@ fsearch --json "fn main" ./src
 ```
 src/
 ├── lib.rs      # 库入口，导出所有公共 API
-├── main.rs     # CLI 入口，参数组装、并行遍历
+├── app.rs      # CLI 主流程：参数组装、并行遍历、结果分发（fsearch / fs 共用）
+├── main.rs     # fsearch 入口（薄包装，调用 app::run）
+├── bin/fs.rs   # fs 入口（短名，同样调用 app::run）
 ├── cli.rs      # clap 参数定义
 ├── config.rs   # .fsearch.toml 配置文件解析
 ├── pattern.rs  # 正则模式构建、字面量识别
@@ -545,10 +568,10 @@ benches/
 cargo test
 ```
 
-包含 **150 个测试**：
+包含 **157 个测试**：
 
-- 89 个库单元测试：搜索、参数组装、JSON 转义、多模式合并、索引、字面量预筛、配置解析
-- 60 个集成测试：调用真实 exe，验证端到端行为
+- 91 个库单元测试：搜索、参数组装、JSON 转义、多模式合并、索引、字面量预筛、配置解析
+- 65 个集成测试：调用真实 exe（含 `fsearch` / `fs` 两个入口），验证端到端行为
 - 1 个 doc-test
 
 ## 代码质量
@@ -609,7 +632,10 @@ cargo bench
 - **索引持久化**：索引按目录路径哈希存到用户缓存目录，多次调用自动复用
 - **字面量预筛**：`aho-corasick` 快速排除不可能命中的行；无上下文时字节级预筛
 - **vimgrep / heading / column**：`Printer` 用构建器模式装配输出选项
-- **库 + 二进制**：核心逻辑在 `lib.rs`，CLI 只是薄薄一层
+- **库 + 二进制**：核心逻辑在 `lib.rs`，CLI 全部在 `app.rs`；
+  `main.rs` 和 `bin/fs.rs` 都只是三行包装
+- **双入口**：程序名取自 `argv[0]`，所以 `fs --help` / `fs --version` /
+  `fs --generate-completions` 输出的都是 `fs`，代码零重复
 - **配置文件**：`.fsearch.toml` 提供目录级默认选项，命令行参数始终优先；
   `--no-config` 可显式忽略
 

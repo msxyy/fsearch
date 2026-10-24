@@ -1382,3 +1382,74 @@ fn column_in_config_file() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(":4:"), "stdout: {stdout}");
 }
+
+// ---------- 短名 fs ----------
+
+fn fs_bin() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_fs"))
+}
+
+#[test]
+fn short_name_searches_like_fsearch() {
+    let dir = TempDir::new("fs_alias");
+    dir.file("a.txt", "hello\nworld\n");
+
+    let out = fs_bin()
+        .arg("-n")
+        .arg("world")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("world"), "stdout: {stdout}");
+}
+
+#[test]
+fn short_name_version_shows_fs() {
+    let out = fs_bin().arg("--version").output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("fs "), "stdout: {stdout}");
+}
+
+#[test]
+fn short_name_usage_shows_fs() {
+    let out = fs_bin().arg("--help").output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Usage: fs ["), "stdout: {stdout}");
+}
+
+#[test]
+fn short_name_completions_use_fs() {
+    let out = fs_bin()
+        .arg("--generate-completions")
+        .arg("bash")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("_fs()"), "stdout: {stdout}");
+    assert!(!stdout.contains("_fsearch()"), "stdout: {stdout}");
+}
+
+#[test]
+fn short_name_returns_one_on_no_match() {
+    let dir = TempDir::new("fs_nomatch");
+    dir.file("a.txt", "hello\n");
+
+    let out = fs_bin()
+        .arg("xyz")
+        .arg(dir.0.to_str().unwrap())
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+}
